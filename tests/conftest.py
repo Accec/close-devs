@@ -35,6 +35,37 @@ def _run_command(
     )
 
 
+def _run_command_with_retry(
+    command: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    attempts: int = 5,
+    delay_seconds: float = 1.0,
+) -> subprocess.CompletedProcess[str]:
+    last_error: subprocess.CalledProcessError | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return _run_command(command, env=env)
+        except subprocess.CalledProcessError as exc:
+            last_error = exc
+            stderr = exc.stderr.lower()
+            transient = any(
+                token in stderr
+                for token in (
+                    "connection reset by peer",
+                    "connection refused",
+                    "the database system is starting up",
+                    "terminating connection",
+                    "could not connect",
+                )
+            )
+            if not transient or attempt == attempts:
+                raise
+            time.sleep(delay_seconds)
+    assert last_error is not None
+    raise last_error
+
+
 @pytest.fixture(scope="session")
 def postgres_database_url() -> str:
     if shutil.which("docker") is None:
@@ -72,6 +103,11 @@ def postgres_database_url() -> str:
         _run_command(["docker", "compose", "logs", "postgres"], env=env, check=False)
         pytest.fail("PostgreSQL service failed to become ready")
 
-    _run_command([sys.executable, "-m", "aerich", "upgrade"], env=env)
+    _run_command_with_retry(
+        [sys.executable, "-m", "aerich", "upgrade"],
+        env=env,
+        attempts=10,
+        delay_seconds=1.0,
+    )
     yield DEFAULT_POSTGRES_URL
     _run_command(["docker", "compose", "down", "-v"], env=env, check=False)

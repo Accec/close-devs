@@ -1,0 +1,16 @@
+[
+  {
+    "scenario": "bootstrap-order-risk",
+    "finding": {
+      "rule_id": "semantic-review-observation",
+      "severity": "high",
+      "category": "architecture",
+      "message": "Bootstrap initialization depends on configuration state that may not be populated before container wiring.",
+      "path": "src/app/bootstrap/application.py"
+    },
+    "fix_request": {
+      "title": "Stabilize bootstrap initialization order",
+      "recommended_change": "Move configuration load ahead of service/container wiring and add a startup guard."
+    }
+  }
+]

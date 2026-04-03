@@ -33,6 +33,7 @@ class StaticTooling:
         targets: list[str],
         config: AppConfig,
         rules: dict[str, Any],
+        env: dict[str, str] | None = None,
     ) -> tuple[list[Finding], dict[str, Any]]:
         findings = await asyncio.to_thread(
             self._internal_findings,
@@ -53,7 +54,8 @@ class StaticTooling:
             if not command:
                 continue
             executable = shlex.split(command)[0]
-            if shutil.which(executable) is None:
+            search_path = env.get("PATH") if env else None
+            if shutil.which(executable, path=search_path) is None:
                 artifacts["external_tools"][tool_name] = {"status": "missing"}
                 continue
             command_targets = targets or ["."]
@@ -66,6 +68,7 @@ class StaticTooling:
                         command=full_command,
                         repo_root=repo_root,
                         timeout_seconds=config.dynamic_debug.timeout_seconds,
+                        env=env,
                     )
                 )
             )
@@ -85,11 +88,13 @@ class StaticTooling:
         command: str,
         repo_root: Path,
         timeout_seconds: int,
+        env: dict[str, str] | None = None,
     ) -> tuple[str, CommandResult]:
         result = await self.runner.run(
             command,
             cwd=repo_root,
             timeout_seconds=timeout_seconds,
+            env=env,
         )
         return tool_name, result
 
@@ -156,12 +161,47 @@ class StaticTooling:
                 )
             )
             findings.extend(
+                self._logic_smell_findings(
+                    relative_path=relative_path,
+                    tree=tree,
+                )
+            )
+            findings.extend(
                 self._architecture_findings(
                     relative_path=relative_path,
                     tree=tree,
                     rules=rules.get("architecture", {}),
                 )
             )
+        return findings
+
+    def _logic_smell_findings(
+        self,
+        relative_path: str,
+        tree: ast.AST,
+    ) -> list[Finding]:
+        findings: list[Finding] = []
+        is_test_file = self._is_test_file(relative_path)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Try):
+                findings.extend(self._exception_handler_findings(relative_path, node))
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                findings.extend(self._mutable_default_findings(relative_path, node))
+            if isinstance(node, ast.Assert) and not is_test_file:
+                findings.append(
+                    Finding(
+                        source_agent=AgentKind.STATIC_REVIEW,
+                        severity=Severity.MEDIUM,
+                        rule_id="assert-used-for-runtime-validation",
+                        message=(
+                            "Runtime code uses assert for validation, which can be stripped "
+                            "with optimization and should be replaced with explicit checks."
+                        ),
+                        category="correctness",
+                        path=relative_path,
+                        line=node.lineno,
+                    )
+                )
         return findings
 
     def _whitespace_findings(self, relative_path: str, content: str) -> list[Finding]:
@@ -267,6 +307,154 @@ class StaticTooling:
                         )
                     )
         return findings
+
+    def _exception_handler_findings(
+        self,
+        relative_path: str,
+        node: ast.Try,
+    ) -> list[Finding]:
+        findings: list[Finding] = []
+        for handler in node.handlers:
+            if handler.type is None:
+                findings.append(
+                    Finding(
+                        source_agent=AgentKind.STATIC_REVIEW,
+                        severity=Severity.HIGH,
+                        rule_id="bare-except",
+                        message=(
+                            "Bare except catches every failure mode and makes root-cause "
+                            "analysis significantly harder."
+                        ),
+                        category="correctness",
+                        path=relative_path,
+                        line=handler.lineno,
+                    )
+                )
+            elif isinstance(handler.type, ast.Name) and handler.type.id in {"Exception", "BaseException"}:
+                findings.append(
+                    Finding(
+                        source_agent=AgentKind.STATIC_REVIEW,
+                        severity=Severity.MEDIUM,
+                        rule_id="broad-exception-catch",
+                        message=(
+                            f"Exception handler catches `{handler.type.id}`, which can hide "
+                            "unrelated failures and make behavior too broad."
+                        ),
+                        category="correctness",
+                        path=relative_path,
+                        line=handler.lineno,
+                    )
+                )
+            if self._suppresses_exception(handler):
+                findings.append(
+                    Finding(
+                        source_agent=AgentKind.STATIC_REVIEW,
+                        severity=Severity.HIGH,
+                        rule_id="swallowed-exception",
+                        message=(
+                            "Exception handler suppresses the original error with control-flow "
+                            "only logic and no logging or re-raise."
+                        ),
+                        category="correctness",
+                        path=relative_path,
+                        line=handler.lineno,
+                    )
+                )
+        return findings
+
+    def _mutable_default_findings(
+        self,
+        relative_path: str,
+        node: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> list[Finding]:
+        findings: list[Finding] = []
+        positional_defaults = [
+            argument.arg
+            for argument, default in zip(
+                node.args.args[-len(node.args.defaults):],
+                node.args.defaults,
+                strict=False,
+            )
+            if self._is_mutable_default(default)
+        ]
+        keyword_defaults = [
+            argument.arg
+            for argument, default in zip(
+                node.args.kwonlyargs,
+                node.args.kw_defaults,
+                strict=False,
+            )
+            if default is not None and self._is_mutable_default(default)
+        ]
+        risky_arguments = positional_defaults + keyword_defaults
+        if not risky_arguments:
+            return findings
+        findings.append(
+            Finding(
+                source_agent=AgentKind.STATIC_REVIEW,
+                severity=Severity.HIGH,
+                rule_id="mutable-default-argument",
+                message=(
+                    "Function uses mutable default argument(s): "
+                    + ", ".join(risky_arguments)
+                    + ". This can leak state across calls."
+                ),
+                category="correctness",
+                path=relative_path,
+                line=node.lineno,
+                symbol=node.name,
+                evidence={"arguments": risky_arguments},
+            )
+        )
+        return findings
+
+    def _suppresses_exception(self, handler: ast.ExceptHandler) -> bool:
+        if not handler.body:
+            return False
+        meaningful_nodes = [
+            node for node in handler.body if not isinstance(node, ast.Expr) or not self._is_literal_expr(node)
+        ]
+        if not meaningful_nodes:
+            return True
+        if any(isinstance(node, ast.Raise) for node in meaningful_nodes):
+            return False
+        if any(self._looks_like_logging(node) for node in meaningful_nodes):
+            return False
+        return all(
+            isinstance(node, (ast.Pass, ast.Return, ast.Continue, ast.Break))
+            for node in meaningful_nodes
+        )
+
+    def _looks_like_logging(self, node: ast.stmt) -> bool:
+        if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
+            return False
+        func = node.value.func
+        if isinstance(func, ast.Attribute) and func.attr in {
+            "debug",
+            "info",
+            "warning",
+            "error",
+            "exception",
+            "critical",
+        }:
+            return True
+        return isinstance(func, ast.Name) and func.id in {"print", "warn"}
+
+    def _is_literal_expr(self, node: ast.Expr) -> bool:
+        return isinstance(node.value, ast.Constant)
+
+    def _is_mutable_default(self, node: ast.AST) -> bool:
+        return isinstance(node, (ast.List, ast.Dict, ast.Set))
+
+    def _is_test_file(self, relative_path: str) -> bool:
+        normalized = relative_path.replace("\\", "/")
+        return (
+            normalized.startswith("tests/")
+            or "/tests/" in normalized
+            or normalized.endswith("_test.py")
+            or normalized.endswith("test_.py")
+            or normalized.endswith("conftest.py")
+        )
 
     def _estimate_complexity(self, node: ast.AST) -> int:
         branch_nodes = (

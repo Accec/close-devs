@@ -68,6 +68,78 @@ class DatabaseConfig:
 
 
 @dataclass(slots=True)
+class EnvironmentConfig:
+    enabled: bool = True
+    scope: str = "all_analysis"
+    install_mode: str = "auto_detect"
+    install_fail_policy: str = "mark_degraded"
+    python_executable: str = "python3"
+    bootstrap_tools: bool = True
+
+
+@dataclass(slots=True)
+class AgentRuntimeConfig:
+    model: str | None = None
+    max_steps: int = 16
+    max_tool_calls: int = 24
+    max_wall_time_seconds: int = 600
+    max_consecutive_failures: int = 3
+    allowed_tools: list[str] = field(default_factory=list)
+    max_budget_ceiling: int = 0
+    allowed_tool_superset: list[str] = field(default_factory=list)
+    safety_lock: bool = True
+
+
+@dataclass(slots=True)
+class SkillAgentConfig:
+    baseline: str = "baseline"
+    auto_upgrade: bool = True
+
+
+@dataclass(slots=True)
+class SkillsConfig:
+    enabled: bool = True
+    repo_root: Path = Path("config/skills")
+    shadow_evaluation_enabled: bool = True
+    min_shadow_runs: int = 5
+    promotion_margin: float = 0.10
+    static: SkillAgentConfig = field(default_factory=SkillAgentConfig)
+    dynamic: SkillAgentConfig = field(default_factory=SkillAgentConfig)
+    maintenance: SkillAgentConfig = field(default_factory=SkillAgentConfig)
+
+
+@dataclass(slots=True)
+class AgentsConfig:
+    static: AgentRuntimeConfig = field(
+        default_factory=lambda: AgentRuntimeConfig(
+            max_steps=24,
+            max_tool_calls=32,
+            max_wall_time_seconds=900,
+            max_consecutive_failures=3,
+            allowed_tools=[],
+        )
+    )
+    dynamic: AgentRuntimeConfig = field(
+        default_factory=lambda: AgentRuntimeConfig(
+            max_steps=32,
+            max_tool_calls=40,
+            max_wall_time_seconds=1200,
+            max_consecutive_failures=4,
+            allowed_tools=[],
+        )
+    )
+    maintenance: AgentRuntimeConfig = field(
+        default_factory=lambda: AgentRuntimeConfig(
+            max_steps=40,
+            max_tool_calls=48,
+            max_wall_time_seconds=1500,
+            max_consecutive_failures=4,
+            allowed_tools=[],
+        )
+    )
+
+
+@dataclass(slots=True)
 class AppConfig:
     repo_root: Path
     state_dir: Path
@@ -77,6 +149,7 @@ class AppConfig:
     exclude: list[str] = field(default_factory=list)
     scan_interval_minutes: int = 60
     log_level: str = "INFO"
+    log_agent_activity: bool = True
     auto_apply_patch: bool = False
     llm: LLMConfig = field(default_factory=LLMConfig)
     static_review: StaticReviewConfig = field(default_factory=StaticReviewConfig)
@@ -84,6 +157,9 @@ class AppConfig:
     github: GitHubRuntimeConfig = field(default_factory=GitHubRuntimeConfig)
     pr_workflow: PRWorkflowConfig = field(default_factory=PRWorkflowConfig)
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
+    environment: EnvironmentConfig = field(default_factory=EnvironmentConfig)
+    agents: AgentsConfig = field(default_factory=AgentsConfig)
+    skills: SkillsConfig = field(default_factory=SkillsConfig)
 
 
 def _resolve_path(base_dir: Path, value: str | None, fallback: str) -> Path:
@@ -114,6 +190,15 @@ def _resolve_database_url(
     return _default_database_url(backend, state_dir)
 
 
+def _infer_database_backend(url: str, configured_backend: str) -> str:
+    lowered = url.lower()
+    if lowered.startswith("sqlite://"):
+        return "sqlite"
+    if lowered.startswith(("postgres://", "postgresql://")):
+        return "postgres"
+    return configured_backend
+
+
 def load_rules(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
@@ -133,6 +218,9 @@ def load_config(path: Path, repo_override: Path | None = None) -> AppConfig:
     github_section = data.get("github", {})
     pr_section = data.get("pr_workflow", {})
     database_section = data.get("database", {})
+    environment_section = data.get("environment", {})
+    agents_section = data.get("agents", {})
+    skills_section = data.get("skills", {})
 
     base_dir = config_path.parent.parent if config_path.parent.name == "config" else config_path.parent
     repo_root = (
@@ -151,6 +239,8 @@ def load_config(path: Path, repo_override: Path | None = None) -> AppConfig:
         url_env=database_url_env,
         state_dir=state_dir,
     )
+    database_backend = _infer_database_backend(database_url, database_backend)
+    skills_repo_root = _resolve_path(base_dir, skills_section.get("repo_root"), "config/skills")
 
     return AppConfig(
         repo_root=repo_root,
@@ -161,6 +251,7 @@ def load_config(path: Path, repo_override: Path | None = None) -> AppConfig:
         exclude=list(app_section.get("exclude", [])),
         scan_interval_minutes=int(app_section.get("scan_interval_minutes", 60)),
         log_level=str(app_section.get("log_level", "INFO")),
+        log_agent_activity=bool(app_section.get("log_agent_activity", True)),
         auto_apply_patch=bool(app_section.get("auto_apply_patch", False)),
         llm=LLMConfig(
             provider=str(llm_section.get("provider", "mock")),
@@ -223,5 +314,127 @@ def load_config(path: Path, repo_override: Path | None = None) -> AppConfig:
             url=str(database_url),
             url_env=database_url_env,
             echo=bool(database_section.get("echo", False)),
+        ),
+        environment=EnvironmentConfig(
+            enabled=bool(environment_section.get("enabled", True)),
+            scope=str(environment_section.get("scope", "all_analysis")),
+            install_mode=str(environment_section.get("install_mode", "auto_detect")),
+            install_fail_policy=str(
+                environment_section.get("install_fail_policy", "mark_degraded")
+            ),
+            python_executable=str(
+                environment_section.get("python_executable", "python3")
+            ),
+            bootstrap_tools=bool(environment_section.get("bootstrap_tools", True)),
+        ),
+        agents=AgentsConfig(
+            static=AgentRuntimeConfig(
+                model=str(agents_section.get("static", {}).get("model"))
+                if agents_section.get("static", {}).get("model") not in (None, "")
+                else None,
+                max_steps=int(agents_section.get("static", {}).get("max_steps", 24)),
+                max_tool_calls=int(agents_section.get("static", {}).get("max_tool_calls", 32)),
+                max_wall_time_seconds=int(
+                    agents_section.get("static", {}).get("max_wall_time_seconds", 900)
+                ),
+                max_consecutive_failures=int(
+                    agents_section.get("static", {}).get("max_consecutive_failures", 3)
+                ),
+                allowed_tools=list(agents_section.get("static", {}).get("allowed_tools", [])),
+                max_budget_ceiling=int(
+                    agents_section.get("static", {}).get(
+                        "max_budget_ceiling",
+                        agents_section.get("static", {}).get("max_steps", 24),
+                    )
+                ),
+                allowed_tool_superset=list(
+                    agents_section.get("static", {}).get(
+                        "allowed_tool_superset",
+                        agents_section.get("static", {}).get("allowed_tools", []),
+                    )
+                ),
+                safety_lock=bool(
+                    agents_section.get("static", {}).get("safety_lock", True)
+                ),
+            ),
+            dynamic=AgentRuntimeConfig(
+                model=str(agents_section.get("dynamic", {}).get("model"))
+                if agents_section.get("dynamic", {}).get("model") not in (None, "")
+                else None,
+                max_steps=int(agents_section.get("dynamic", {}).get("max_steps", 32)),
+                max_tool_calls=int(agents_section.get("dynamic", {}).get("max_tool_calls", 40)),
+                max_wall_time_seconds=int(
+                    agents_section.get("dynamic", {}).get("max_wall_time_seconds", 1200)
+                ),
+                max_consecutive_failures=int(
+                    agents_section.get("dynamic", {}).get("max_consecutive_failures", 4)
+                ),
+                allowed_tools=list(agents_section.get("dynamic", {}).get("allowed_tools", [])),
+                max_budget_ceiling=int(
+                    agents_section.get("dynamic", {}).get(
+                        "max_budget_ceiling",
+                        agents_section.get("dynamic", {}).get("max_steps", 32),
+                    )
+                ),
+                allowed_tool_superset=list(
+                    agents_section.get("dynamic", {}).get(
+                        "allowed_tool_superset",
+                        agents_section.get("dynamic", {}).get("allowed_tools", []),
+                    )
+                ),
+                safety_lock=bool(
+                    agents_section.get("dynamic", {}).get("safety_lock", True)
+                ),
+            ),
+            maintenance=AgentRuntimeConfig(
+                model=str(agents_section.get("maintenance", {}).get("model"))
+                if agents_section.get("maintenance", {}).get("model") not in (None, "")
+                else None,
+                max_steps=int(agents_section.get("maintenance", {}).get("max_steps", 40)),
+                max_tool_calls=int(agents_section.get("maintenance", {}).get("max_tool_calls", 48)),
+                max_wall_time_seconds=int(
+                    agents_section.get("maintenance", {}).get("max_wall_time_seconds", 1500)
+                ),
+                max_consecutive_failures=int(
+                    agents_section.get("maintenance", {}).get("max_consecutive_failures", 4)
+                ),
+                allowed_tools=list(agents_section.get("maintenance", {}).get("allowed_tools", [])),
+                max_budget_ceiling=int(
+                    agents_section.get("maintenance", {}).get(
+                        "max_budget_ceiling",
+                        agents_section.get("maintenance", {}).get("max_steps", 40),
+                    )
+                ),
+                allowed_tool_superset=list(
+                    agents_section.get("maintenance", {}).get(
+                        "allowed_tool_superset",
+                        agents_section.get("maintenance", {}).get("allowed_tools", []),
+                    )
+                ),
+                safety_lock=bool(
+                    agents_section.get("maintenance", {}).get("safety_lock", True)
+                ),
+            ),
+        ),
+        skills=SkillsConfig(
+            enabled=bool(skills_section.get("enabled", True)),
+            repo_root=skills_repo_root,
+            shadow_evaluation_enabled=bool(
+                skills_section.get("shadow_evaluation_enabled", True)
+            ),
+            min_shadow_runs=int(skills_section.get("min_shadow_runs", 5)),
+            promotion_margin=float(skills_section.get("promotion_margin", 0.10)),
+            static=SkillAgentConfig(
+                baseline=str(skills_section.get("static", {}).get("baseline", "baseline")),
+                auto_upgrade=bool(skills_section.get("static", {}).get("auto_upgrade", True)),
+            ),
+            dynamic=SkillAgentConfig(
+                baseline=str(skills_section.get("dynamic", {}).get("baseline", "baseline")),
+                auto_upgrade=bool(skills_section.get("dynamic", {}).get("auto_upgrade", True)),
+            ),
+            maintenance=SkillAgentConfig(
+                baseline=str(skills_section.get("maintenance", {}).get("baseline", "baseline")),
+                auto_upgrade=bool(skills_section.get("maintenance", {}).get("auto_upgrade", True)),
+            ),
         ),
     )

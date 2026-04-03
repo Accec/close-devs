@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import asyncio
+import os
 import time
 
 
@@ -22,11 +23,16 @@ class CommandRunner:
         command: str,
         cwd: Path,
         timeout_seconds: int = 120,
+        env: dict[str, str] | None = None,
     ) -> CommandResult:
         started = time.perf_counter()
+        merged_env = dict(os.environ)
+        if env:
+            merged_env.update(env)
         process = await asyncio.create_subprocess_shell(
             command,
             cwd=str(cwd),
+            env=merged_env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )

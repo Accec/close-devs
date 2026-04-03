@@ -1,0 +1,16 @@
+[
+  {
+    "scenario": "missing-dependency",
+    "finding": {
+      "rule_id": "runtime-root-cause",
+      "severity": "high",
+      "category": "runtime",
+      "message": "Pytest collection fails because argon2-cffi is not installed in the isolated environment.",
+      "path": "src/infra/security/passwords.py"
+    },
+    "fix_request": {
+      "title": "Declare missing runtime dependency",
+      "recommended_change": "Add argon2-cffi to the project dependency source used by the runtime environment."
+    }
+  }
+]

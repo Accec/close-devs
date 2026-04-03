@@ -33,14 +33,20 @@ class TaskDispatcher:
         )
         return static_task, dynamic_task
 
-    def create_maintenance_task(self, run_id: str, feedback: FeedbackBundle) -> Task:
+    def create_maintenance_task(
+        self,
+        run_id: str,
+        feedback: FeedbackBundle,
+        *,
+        handoffs: list[dict[str, object]] | None = None,
+    ) -> Task:
         return Task(
             task_id=self._new_task_id(),
             run_id=run_id,
             agent_kind=AgentKind.MAINTENANCE,
             task_type=TaskType.MAINTENANCE,
             targets=feedback.change_set.all_touched_files,
-            payload={"feedback": feedback},
+            payload={"feedback": feedback, "handoffs": list(handoffs or [])},
         )
 
     def create_validation_tasks(
@@ -66,4 +72,3 @@ class TaskDispatcher:
             payload={"commands": commands, "validation": True},
         )
         return static_task, dynamic_task
-

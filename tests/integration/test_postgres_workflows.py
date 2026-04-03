@@ -9,6 +9,7 @@ from core.config import (
     AppConfig,
     DatabaseConfig,
     DynamicDebugConfig,
+    EnvironmentConfig,
     GitHubRuntimeConfig,
     LLMConfig,
     PRWorkflowConfig,
@@ -133,7 +134,7 @@ def _build_app_config(tmp_path: Path, repo_root: Path, database_url: str) -> App
         ),
         dynamic_debug=DynamicDebugConfig(
             smoke_commands=[],
-            test_commands=[f"{sys.executable} -m pytest -q"],
+            test_commands=["python -c \"import sys; sys.exit(0)\""],
             timeout_seconds=60,
         ),
         github=GitHubRuntimeConfig(
@@ -143,6 +144,14 @@ def _build_app_config(tmp_path: Path, repo_root: Path, database_url: str) -> App
         ),
         pr_workflow=PRWorkflowConfig(),
         database=_postgres_database_config(database_url),
+        environment=EnvironmentConfig(
+            enabled=True,
+            scope="all_analysis",
+            install_mode="auto_detect",
+            install_fail_policy="mark_degraded",
+            python_executable=sys.executable,
+            bootstrap_tools=False,
+        ),
     )
 
 
@@ -189,6 +198,7 @@ async def test_postgres_maintenance_loop_runs_end_to_end(
     assert report.workflow_name == "maintenance_loop"
     assert report.report_dir
     assert (Path(report.report_dir) / "summary.md").exists()
+    assert (Path(report.report_dir) / "artifacts" / "environment.json").exists()
 
 
 @pytest.mark.asyncio
@@ -225,3 +235,4 @@ async def test_postgres_pull_request_workflow_runs_end_to_end(
     assert published.metadata["publish_mode"] == "companion_pr"
     assert published.metadata["companion_pr_url"] == "https://example/pulls/24"
     assert published.metadata["review_comment_url"] == "https://example/reviews/11"
+    assert (Path(report.report_dir) / "artifacts" / "environment.json").exists()

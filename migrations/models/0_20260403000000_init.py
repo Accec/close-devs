@@ -3,8 +3,95 @@ from tortoise import BaseDBAsyncClient
 RUN_IN_TRANSACTION = True
 
 
-async def upgrade(db: BaseDBAsyncClient) -> str:
+def _sqlite_upgrade_sql() -> str:
     return """
+        CREATE TABLE IF NOT EXISTS "aerich" (
+            "id" INTEGER PRIMARY KEY AUTOINCREMENT,
+            "version" VARCHAR(255) NOT NULL,
+            "app" VARCHAR(100) NOT NULL,
+            "content" JSON NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS "runs" (
+            "run_id" VARCHAR(32) NOT NULL PRIMARY KEY,
+            "workflow_name" VARCHAR(128) NOT NULL,
+            "repo_root" TEXT NOT NULL,
+            "started_at" TIMESTAMPTZ NOT NULL,
+            "finished_at" TIMESTAMPTZ,
+            "status" VARCHAR(32) NOT NULL,
+            "summary" TEXT,
+            "report_dir" TEXT
+        );
+        CREATE TABLE IF NOT EXISTS "snapshots" (
+            "run_id" VARCHAR(32) NOT NULL PRIMARY KEY,
+            "repo_root" TEXT NOT NULL,
+            "scanned_at" TIMESTAMPTZ NOT NULL,
+            "revision" TEXT,
+            "file_hashes" JSON NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS "tasks" (
+            "task_id" VARCHAR(64) NOT NULL PRIMARY KEY,
+            "run_id" VARCHAR(32) NOT NULL,
+            "agent_kind" VARCHAR(32) NOT NULL,
+            "task_type" VARCHAR(32) NOT NULL,
+            "targets" JSON NOT NULL,
+            "payload_summary" JSON NOT NULL,
+            "created_at" TIMESTAMPTZ NOT NULL,
+            "status" VARCHAR(32) NOT NULL,
+            "summary" TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS "idx_tasks_run_id" ON "tasks" ("run_id");
+        CREATE TABLE IF NOT EXISTS "findings" (
+            "id" INTEGER PRIMARY KEY AUTOINCREMENT,
+            "run_id" VARCHAR(32) NOT NULL,
+            "task_id" VARCHAR(64) NOT NULL,
+            "agent_kind" VARCHAR(32) NOT NULL,
+            "severity" VARCHAR(32) NOT NULL,
+            "rule_id" VARCHAR(255) NOT NULL,
+            "category" VARCHAR(64) NOT NULL,
+            "path" TEXT,
+            "line" INT,
+            "symbol" TEXT,
+            "message" TEXT NOT NULL,
+            "fingerprint" TEXT NOT NULL,
+            "evidence" JSON NOT NULL,
+            "state" VARCHAR(32) NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS "idx_findings_run_id" ON "findings" ("run_id");
+        CREATE INDEX IF NOT EXISTS "idx_findings_task_id" ON "findings" ("task_id");
+        CREATE TABLE IF NOT EXISTS "patches" (
+            "run_id" VARCHAR(32) NOT NULL PRIMARY KEY,
+            "summary" TEXT NOT NULL,
+            "rationale" TEXT NOT NULL,
+            "touched_files" JSON NOT NULL,
+            "diff_text" TEXT NOT NULL,
+            "suggestions" JSON NOT NULL,
+            "applied" BOOL NOT NULL,
+            "file_patches" JSON NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS "issue_catalog" (
+            "id" INTEGER PRIMARY KEY AUTOINCREMENT,
+            "repo_root" TEXT NOT NULL,
+            "fingerprint" TEXT NOT NULL,
+            "rule_id" VARCHAR(255) NOT NULL,
+            "path" TEXT,
+            "message" TEXT NOT NULL,
+            "status" VARCHAR(32) NOT NULL,
+            "first_seen_run" VARCHAR(32) NOT NULL,
+            "last_seen_run" VARCHAR(32) NOT NULL,
+            "occurrences" INT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS "uid_issue_catalog_repo_fingerprint"
+            ON "issue_catalog" ("repo_root", "fingerprint");"""
+
+
+def _postgres_upgrade_sql() -> str:
+    return """
+        CREATE TABLE IF NOT EXISTS "aerich" (
+            "id" SERIAL NOT NULL PRIMARY KEY,
+            "version" VARCHAR(255) NOT NULL,
+            "app" VARCHAR(100) NOT NULL,
+            "content" JSONB NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS "runs" (
             "run_id" VARCHAR(32) NOT NULL PRIMARY KEY,
             "workflow_name" VARCHAR(128) NOT NULL,
@@ -78,6 +165,12 @@ async def upgrade(db: BaseDBAsyncClient) -> str:
             ON "issue_catalog" ("repo_root", "fingerprint");"""
 
 
+async def upgrade(db: BaseDBAsyncClient) -> str:
+    if db.capabilities.dialect == "sqlite":
+        return _sqlite_upgrade_sql()
+    return _postgres_upgrade_sql()
+
+
 async def downgrade(db: BaseDBAsyncClient) -> str:
     return """
         DROP TABLE IF EXISTS "issue_catalog";
@@ -85,7 +178,8 @@ async def downgrade(db: BaseDBAsyncClient) -> str:
         DROP TABLE IF EXISTS "findings";
         DROP TABLE IF EXISTS "tasks";
         DROP TABLE IF EXISTS "snapshots";
-        DROP TABLE IF EXISTS "runs";"""
+        DROP TABLE IF EXISTS "runs";
+        DROP TABLE IF EXISTS "aerich";"""
 
 
 MODELS_STATE = (

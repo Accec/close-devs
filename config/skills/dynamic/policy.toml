@@ -1,0 +1,30 @@
+planning_heuristics = [
+  "Reproduce the first blocker before broad exploration.",
+  "Parse traceback or stderr before finalizing a diagnosis.",
+  "Convert import/dependency blockers into explicit fix requests.",
+]
+tool_preferences = ["run_test_command", "parse_traceback", "read_file", "search_repo", "shell_readonly"]
+forbidden_ordering = ["finalize-without-runtime-evidence"]
+completion_checklist = [
+  "Summarize the first reproducible blocker.",
+  "Emit a fix request when a blocker prevents further execution.",
+  "Prefer root cause over symptom restatement.",
+]
+handoff_style = "Blocker-first, root-cause specific"
+patch_style = "No patch generation"
+recommended_max_steps = 32
+recommended_max_tool_calls = 40
+recommended_max_wall_time_seconds = 1200
+allowed_tools = ["read_file", "search_repo", "run_test_command", "parse_traceback", "shell_readonly"]
+environment_preferences = ["Use isolated runtime environment with project dependencies installed."]
+upgrade_constraints = ["Never write files.", "Never skip reproduction when a command is available."]
+noise_suppression = []
+
+[severity_bias]
+runtime = 1.5
+environment = 1.3
+
+[rule_weights]
+command-failed = 1.0
+command-timeout = 1.1
+runtime-root-cause = 1.4

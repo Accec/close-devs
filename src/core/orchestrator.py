@@ -11,7 +11,7 @@ from langgraph.graph import END, START, StateGraph
 from agents.dynamic_debug import DynamicDebugAgent
 from agents.maintenance import MaintenanceAgent
 from agents.static_review import StaticReviewAgent
-from core.config import AppConfig, load_config, load_rules
+from core.config import AgentRuntimeConfig, AppConfig, LLMConfig, load_config, load_rules
 from core.dispatcher import TaskDispatcher
 from core.logging import configure_logging
 from core.models import (
@@ -19,6 +19,7 @@ from core.models import (
     AgentResult,
     ArtifactReference,
     ChangeSet,
+    ExecutionEnvironment,
     FeedbackBundle,
     PublishContext,
     PublishMode,
@@ -43,8 +44,12 @@ from repo.change_detector import ChangeDetector
 from repo.scanner import RepositoryScanner
 from reports.markdown import write_markdown
 from reports.serializer import publish_context_from_dict, read_json, workflow_report_from_dict, write_json
+from skills.evolution import SkillEvolutionService
+from skills.manager import SkillManager
 from tools.file_store import FileStore
+from tools.environment_manager import EnvironmentManager
 from tools.patch_service import PatchService
+from tools.agent_toolkit import AgentToolkitFactory
 from workflows.incident_debug import IncidentDebugWorkflow
 from workflows.maintenance_loop import MaintenanceLoopWorkflow
 from workflows.pull_request_maintenance import PullRequestMaintenanceWorkflow
@@ -69,10 +74,44 @@ class Orchestrator:
         self.file_store = FileStore()
         self.patch_service = PatchService(self.file_store)
         self.safe_fix_policy = SafeFixPolicy()
-        self.static_agent = StaticReviewAgent()
-        self.dynamic_agent = DynamicDebugAgent()
+        self.skill_manager = SkillManager(config, state_store)
+        self.skill_evolution = SkillEvolutionService(config, state_store)
+        self.toolkit_factory = AgentToolkitFactory(
+            file_store=self.file_store,
+            patch_service=self.patch_service,
+            safe_fix_policy=self.safe_fix_policy,
+        )
+        self.environment_manager = EnvironmentManager(
+            file_store=self.file_store,
+            command_runner=self.toolkit_factory.command_runner,
+            logger=self.logger,
+        )
+        self.static_llm_client = build_llm_client(
+            self._agent_llm_config(config.agents.static.model),
+            self.logger,
+        )
+        self.dynamic_llm_client = build_llm_client(
+            self._agent_llm_config(config.agents.dynamic.model),
+            self.logger,
+        )
+        self.maintenance_llm_client = build_llm_client(
+            self._agent_llm_config(config.agents.maintenance.model),
+            self.logger,
+        )
+        self.static_agent = StaticReviewAgent(
+            llm_client=self.static_llm_client,
+            runtime_config=config.agents.static,
+            toolkit_factory=self.toolkit_factory,
+        )
+        self.dynamic_agent = DynamicDebugAgent(
+            llm_client=self.dynamic_llm_client,
+            runtime_config=config.agents.dynamic,
+            toolkit_factory=self.toolkit_factory,
+        )
         self.maintenance_agent = MaintenanceAgent(
-            llm_client=build_llm_client(config.llm, self.logger),
+            llm_client=self.maintenance_llm_client,
+            runtime_config=config.agents.maintenance,
+            toolkit_factory=self.toolkit_factory,
             patch_service=self.patch_service,
             file_store=self.file_store,
             safe_fix_policy=self.safe_fix_policy,
@@ -80,6 +119,38 @@ class Orchestrator:
         self.github_adapter = github_adapter or GitHubAdapter(
             config.github,
             logger=self.logger,
+        )
+        self._log_agent_runtime("static_review", self.static_llm_client, config.agents.static)
+        self._log_agent_runtime("dynamic_debug", self.dynamic_llm_client, config.agents.dynamic)
+        self._log_agent_runtime("maintenance", self.maintenance_llm_client, config.agents.maintenance)
+
+    def _agent_llm_config(self, model_override: str | None) -> LLMConfig:
+        if not model_override:
+            return self.config.llm
+        return LLMConfig(
+            provider=self.config.llm.provider,
+            model=model_override,
+            base_url=self.config.llm.base_url,
+            api_key_env=self.config.llm.api_key_env,
+            timeout_seconds=self.config.llm.timeout_seconds,
+            temperature=self.config.llm.temperature,
+            system_prompt=self.config.llm.system_prompt,
+        )
+
+    def _log_agent_runtime(
+        self,
+        agent_name: str,
+        llm_client: object,
+        runtime_config: AgentRuntimeConfig,
+    ) -> None:
+        self.logger.info(
+            "Agent runtime ready: agent=%s client=%s model=%s max_steps=%s max_tool_calls=%s tools=%s",
+            agent_name,
+            type(llm_client).__name__,
+            runtime_config.model or self.config.llm.model,
+            runtime_config.max_steps,
+            runtime_config.max_tool_calls,
+            ",".join(runtime_config.allowed_tools),
         )
 
     @classmethod
@@ -151,6 +222,15 @@ class Orchestrator:
             AgentKind.DYNAMIC_DEBUG: self.dynamic_agent,
             AgentKind.MAINTENANCE: self.maintenance_agent,
         }[task.agent_kind]
+        task_logger = context.logger.getChild(f"agent.{task.agent_kind.value}")
+        if context.config.log_agent_activity:
+            task_logger.info(
+                "Task dispatched: task=%s type=%s targets=%s working_repo=%s",
+                task.task_id,
+                task.task_type.value,
+                len(task.targets),
+                context.working_repo_root,
+            )
         try:
             result = await agent.run(task, context)
         except Exception as exc:
@@ -163,6 +243,33 @@ class Orchestrator:
                 summary=f"Task failed: {exc}",
                 errors=[str(exc)],
             )
+        if context.config.log_agent_activity:
+            task_logger.info(
+                "Task finished: task=%s status=%s findings=%s patch_files=%s summary=%s",
+                task.task_id,
+                result.status.value,
+                len(result.findings),
+                len(result.patch.file_patches) if result.patch else 0,
+                result.summary,
+            )
+        reflection, candidate = await self.skill_evolution.reflect_and_seed_candidate(
+            repo_root=str(context.repo_root),
+            run_id=context.run_id,
+            task_id=task.task_id,
+            session_id=str(result.artifacts.get("session_id", "")),
+            result=result,
+            active_skill=context.active_skill,
+        )
+        if reflection is not None:
+            result.artifacts["reflection"] = {
+                "summary": reflection.summary,
+                "metrics": reflection.metrics,
+                "upgrade_hints": reflection.upgrade_hints,
+                "skill_version": reflection.skill_version,
+            }
+            result.artifacts["upgrade_hints"] = list(reflection.upgrade_hints)
+        if candidate is not None:
+            result.artifacts["candidate_skill_version"] = candidate.version
         await self.state_store.save_agent_result(context.run_id, task, result)
         return result
 
@@ -196,9 +303,23 @@ class Orchestrator:
             started_at=started_at,
         )
         try:
+            environment = await self._prepare_execution_environment(run_id, self.config.repo_root)
+            active_skills, candidate_skills = await self._prepare_run_skills(self.config.repo_root)
             snapshot, change_set = await self.scan_repository()
             await self.state_store.save_snapshot(run_id, snapshot)
-            context = self._build_context(run_id, working_repo_root=self.config.repo_root)
+            analysis_root = (
+                Path(environment.base_workspace_root)
+                if environment is not None
+                else self.config.repo_root
+            )
+            context = self._build_context(
+                run_id,
+                working_repo_root=analysis_root,
+                repo_root=self.config.repo_root,
+                execution_environment=environment,
+                active_skill=active_skills.get(AgentKind.STATIC_REVIEW.value),
+                candidate_skill=candidate_skills.get(AgentKind.STATIC_REVIEW.value),
+            )
             task = Task(
                 task_id=self.dispatcher._new_task_id(),
                 run_id=run_id,
@@ -208,6 +329,10 @@ class Orchestrator:
                 payload={},
             )
             result = await self.execute_task(task, context)
+            candidate_skills = await self._refresh_candidate_skills(
+                {"candidate_skills": candidate_skills},
+                self.config.repo_root,
+            )
             await self.issue_catalog.record_findings(str(self.config.repo_root), run_id, result.findings)
             report = WorkflowReport(
                 run_id=run_id,
@@ -219,6 +344,16 @@ class Orchestrator:
                 snapshot=snapshot,
                 change_set=change_set,
                 static_result=result,
+                report_dir=str(Path(environment.report_dir)) if environment is not None else "",
+                metadata=self._environment_metadata(environment),
+            )
+            report.metadata.update(
+                await self.skill_evolution.evaluate_report(
+                    repo_root=str(self.config.repo_root),
+                    report=report,
+                    active_skills=active_skills,
+                    candidate_skills=candidate_skills,
+                )
             )
             report_dir = await self._write_report_artifacts(report)
             report.report_dir = str(report_dir)
@@ -409,15 +544,132 @@ class Orchestrator:
             return None
         return Path(str(latest["report_dir"]))
 
-    def _build_context(self, run_id: str, working_repo_root: Path) -> RunContext:
+    def _build_context(
+        self,
+        run_id: str,
+        working_repo_root: Path,
+        repo_root: Path | None = None,
+        execution_environment: ExecutionEnvironment | None = None,
+        active_skill=None,
+        candidate_skill=None,
+    ) -> RunContext:
         return RunContext(
             run_id=run_id,
-            repo_root=self.config.repo_root,
+            repo_root=repo_root or self.config.repo_root,
             working_repo_root=working_repo_root,
             config=self.config,
             state_store=self.state_store,
             logger=self.logger,
             rules=self.rules,
+            execution_environment=execution_environment,
+            active_skill=active_skill,
+            candidate_skill=candidate_skill,
+        )
+
+    async def _prepare_execution_environment(
+        self,
+        run_id: str,
+        source_repo_root: Path,
+    ) -> ExecutionEnvironment | None:
+        if not self.config.environment.enabled:
+            return None
+        report_dir = self.config.reports_dir / run_id
+        await self.file_store.ensure_dir(report_dir)
+        return await self.environment_manager.prepare(
+            report_dir=report_dir,
+            source_repo_root=source_repo_root,
+            config=self.config,
+        )
+
+    async def _prepare_run_skills(
+        self,
+        repo_root: Path,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        return await self.skill_manager.resolve_run_skills(
+            repo_root,
+            {
+                AgentKind.STATIC_REVIEW: self.config.agents.static,
+                AgentKind.DYNAMIC_DEBUG: self.config.agents.dynamic,
+                AgentKind.MAINTENANCE: self.config.agents.maintenance,
+            },
+        )
+
+    def _source_repo_root(self, state: WorkflowState) -> Path:
+        if "pr_repo_root" in state:
+            return Path(state["pr_repo_root"])
+        return self.config.repo_root
+
+    def _analysis_root(self, state: WorkflowState) -> Path:
+        environment = state.get("execution_environment")
+        if environment is not None:
+            return Path(environment.base_workspace_root)
+        return self._source_repo_root(state)
+
+    def _maintenance_root(self, state: WorkflowState) -> Path:
+        environment = state.get("execution_environment")
+        if environment is not None:
+            return Path(environment.maintenance_workspace_root)
+        return self._analysis_root(state)
+
+    def _validation_root(self, state: WorkflowState) -> Path:
+        environment = state.get("execution_environment")
+        if environment is not None:
+            return Path(environment.validation_workspace_root)
+        if "validation_workspace_root" in state:
+            return Path(state["validation_workspace_root"])
+        return self._analysis_root(state)
+
+    def _skill_for_agent(self, state: WorkflowState, agent_kind: AgentKind):
+        active_skill = state.get("active_skills", {}).get(agent_kind.value)
+        candidate_skill = state.get("candidate_skills", {}).get(agent_kind.value)
+        return active_skill, candidate_skill
+
+    async def _refresh_candidate_skills(
+        self,
+        state: WorkflowState,
+        repo_root: Path,
+    ) -> dict[str, object]:
+        refreshed = dict(state.get("candidate_skills", {}))
+        for agent_kind in AgentKind:
+            candidate = await self.state_store.get_open_skill_candidate(str(repo_root), agent_kind)
+            if candidate is not None:
+                refreshed[agent_kind.value] = candidate
+            elif agent_kind.value in refreshed:
+                refreshed.pop(agent_kind.value, None)
+        return refreshed
+
+    def _environment_metadata(
+        self,
+        environment: ExecutionEnvironment | None,
+    ) -> dict[str, object]:
+        if environment is None:
+            return {}
+        return {
+            "environment_status": environment.status,
+            "environment_degraded": environment.degraded,
+            "dependency_sources": list(environment.detected_sources),
+            "install_commands": list(environment.install_commands),
+            "install_failures": list(environment.install_errors),
+            "runtime_root": environment.runtime_root,
+            "venv_root": environment.venv_root,
+            "base_workspace_root": environment.base_workspace_root,
+            "maintenance_workspace_root": environment.maintenance_workspace_root,
+            "validation_workspace_root": environment.validation_workspace_root,
+            "environment_json_path": environment.environment_json_path,
+            "install_log_path": environment.install_log_path,
+            "bootstrap_packages": list(environment.bootstrap_packages),
+        }
+
+    async def _skill_report_metadata(self, state: WorkflowState, report: WorkflowReport) -> dict[str, object]:
+        candidate_skills = await self._refresh_candidate_skills(
+            state,
+            self._source_repo_root(state),
+        )
+        return await self.skill_evolution.evaluate_report(
+            repo_root=str(self._source_repo_root(state)),
+            report=report,
+            active_skills=dict(state.get("active_skills", {})),
+            candidate_skills=candidate_skills,
         )
 
     def _dynamic_commands(self) -> list[str]:
@@ -489,6 +741,8 @@ class Orchestrator:
         return graph.compile()
 
     async def _node_scan_maintenance(self, state: WorkflowState) -> WorkflowState:
+        environment = await self._prepare_execution_environment(state["run_id"], self.config.repo_root)
+        active_skills, candidate_skills = await self._prepare_run_skills(self.config.repo_root)
         snapshot, change_set = await self.scan_repository()
         await self.state_store.save_snapshot(state["run_id"], snapshot)
         review_targets = sorted(set(change_set.changed_files + change_set.added_files))
@@ -502,9 +756,15 @@ class Orchestrator:
             "change_set": change_set,
             "static_task": static_task,
             "dynamic_task": dynamic_task,
+            "execution_environment": environment,
+            "active_skills": active_skills,
+            "candidate_skills": candidate_skills,
+            "report_dir": environment.report_dir if environment is not None else str(self.config.reports_dir / state["run_id"]),
         }
 
     async def _node_scan_incident_debug(self, state: WorkflowState) -> WorkflowState:
+        environment = await self._prepare_execution_environment(state["run_id"], self.config.repo_root)
+        active_skills, candidate_skills = await self._prepare_run_skills(self.config.repo_root)
         snapshot, change_set = await self.scan_repository()
         await self.state_store.save_snapshot(state["run_id"], snapshot)
         dynamic_task = Task(
@@ -519,6 +779,10 @@ class Orchestrator:
             "snapshot": snapshot,
             "change_set": change_set,
             "dynamic_task": dynamic_task,
+            "execution_environment": environment,
+            "active_skills": active_skills,
+            "candidate_skills": candidate_skills,
+            "report_dir": environment.report_dir if environment is not None else str(self.config.reports_dir / state["run_id"]),
         }
 
     async def _node_load_pr_context(self, state: WorkflowState) -> WorkflowState:
@@ -543,8 +807,10 @@ class Orchestrator:
         return {"pr_repo_root": str(workspace)}
 
     async def _node_scan_pr_repo(self, state: WorkflowState) -> WorkflowState:
-        repo_root = Path(state["pr_repo_root"])
-        snapshot, change_set = await self.scan_repository(repo_root, state["pr_context"])
+        source_root = Path(state["pr_repo_root"])
+        environment = await self._prepare_execution_environment(state["run_id"], source_root)
+        active_skills, candidate_skills = await self._prepare_run_skills(source_root)
+        snapshot, change_set = await self.scan_repository(source_root, state["pr_context"])
         await self.state_store.save_snapshot(state["run_id"], snapshot)
         review_targets = sorted(set(change_set.changed_files + change_set.added_files))
         static_task, dynamic_task = self.dispatcher.create_review_tasks(
@@ -557,21 +823,41 @@ class Orchestrator:
             "change_set": change_set,
             "static_task": static_task,
             "dynamic_task": dynamic_task,
+            "execution_environment": environment,
+            "active_skills": active_skills,
+            "candidate_skills": candidate_skills,
+            "report_dir": environment.report_dir if environment is not None else str(self.config.reports_dir / state["run_id"]),
         }
 
     async def _node_static_review(self, state: WorkflowState) -> WorkflowState:
-        root = self._resolve_task_root(state, validation=False)
-        context = self._build_context(state["run_id"], root)
         task = state["validation_static_task"] if "validation_static_task" in state else state["static_task"]
+        root = self._validation_root(state) if task.task_type == TaskType.VALIDATION_STATIC else self._analysis_root(state)
+        active_skill, candidate_skill = self._skill_for_agent(state, AgentKind.STATIC_REVIEW)
+        context = self._build_context(
+            state["run_id"],
+            root,
+            repo_root=self._source_repo_root(state),
+            execution_environment=state.get("execution_environment"),
+            active_skill=active_skill,
+            candidate_skill=candidate_skill,
+        )
         result = await self.execute_task(task, context)
         if task.task_type == TaskType.VALIDATION_STATIC:
             return {"validation_static_result": result}
         return {"static_result": result}
 
     async def _node_dynamic_debug(self, state: WorkflowState) -> WorkflowState:
-        root = self._resolve_task_root(state, validation="validation_dynamic_task" in state)
-        context = self._build_context(state["run_id"], root)
         task = state["validation_dynamic_task"] if "validation_dynamic_task" in state else state["dynamic_task"]
+        root = self._validation_root(state) if task.task_type == TaskType.VALIDATION_DYNAMIC else self._analysis_root(state)
+        active_skill, candidate_skill = self._skill_for_agent(state, AgentKind.DYNAMIC_DEBUG)
+        context = self._build_context(
+            state["run_id"],
+            root,
+            repo_root=self._source_repo_root(state),
+            execution_environment=state.get("execution_environment"),
+            active_skill=active_skill,
+            candidate_skill=candidate_skill,
+        )
         result = await self.execute_task(task, context)
         if task.task_type == TaskType.VALIDATION_DYNAMIC:
             return {"validation_dynamic_result": result}
@@ -579,28 +865,74 @@ class Orchestrator:
 
     async def _node_feedback_merge(self, state: WorkflowState) -> WorkflowState:
         initial_findings = [*state["static_result"].findings, *state["dynamic_result"].findings]
-        await self.issue_catalog.record_findings(str(self.config.repo_root), state["run_id"], initial_findings)
+        await self.issue_catalog.record_findings(
+            str(self._source_repo_root(state)),
+            state["run_id"],
+            initial_findings,
+        )
+        handoffs = [
+            *[
+                item
+                for item in state["static_result"].artifacts.get("handoffs", [])
+                if isinstance(item, dict)
+            ],
+            *[
+                item
+                for item in state["dynamic_result"].artifacts.get("handoffs", [])
+                if isinstance(item, dict)
+            ],
+        ]
         feedback = FeedbackBundle(
             snapshot=state["snapshot"],
             change_set=state["change_set"],
             static_findings=state["static_result"].findings,
             dynamic_findings=state["dynamic_result"].findings,
         )
-        maintenance_task = self.dispatcher.create_maintenance_task(state["run_id"], feedback)
+        maintenance_task = self.dispatcher.create_maintenance_task(
+            state["run_id"],
+            feedback,
+            handoffs=handoffs,
+        )
         return {
             "feedback": feedback,
             "maintenance_task": maintenance_task,
+            "candidate_skills": await self._refresh_candidate_skills(
+                state,
+                self._source_repo_root(state),
+            ),
+            "artifacts": {"handoff_count": len(handoffs)},
         }
 
     async def _node_maintenance(self, state: WorkflowState) -> WorkflowState:
-        context = self._build_context(state["run_id"], self._resolve_task_root(state, validation=False))
+        maintenance_root = self._maintenance_root(state)
+        active_skill, candidate_skill = self._skill_for_agent(state, AgentKind.MAINTENANCE)
+        context = self._build_context(
+            state["run_id"],
+            maintenance_root,
+            repo_root=self._source_repo_root(state),
+            execution_environment=state.get("execution_environment"),
+            active_skill=active_skill,
+            candidate_skill=candidate_skill,
+        )
         result = await self.execute_task(state["maintenance_task"], context)
-        updates: WorkflowState = {"maintenance_result": result}
+        updates: WorkflowState = {
+            "maintenance_result": result,
+            "candidate_skills": await self._refresh_candidate_skills(
+                state,
+                self._source_repo_root(state),
+            ),
+        }
         patch = result.patch
         if patch is not None and patch.file_patches:
-            base_root = self._resolve_task_root(state, validation=False)
-            validation_workspace_root = await self.file_store.materialize_workspace_copy(base_root)
-            await self.patch_service.apply(validation_workspace_root, patch)
+            if state.get("execution_environment") is not None:
+                await self.patch_service.apply(maintenance_root, patch)
+                validation_workspace_root = await self.environment_manager.refresh_validation_workspace(
+                    state["execution_environment"]
+                )
+            else:
+                base_root = self._analysis_root(state)
+                validation_workspace_root = await self.file_store.materialize_workspace_copy(base_root)
+                await self.patch_service.apply(validation_workspace_root, patch)
             validation_snapshot = await self.scanner.scan(validation_workspace_root)
             static_task, dynamic_task = self.dispatcher.create_validation_tasks(
                 run_id=state["run_id"],
@@ -657,14 +989,14 @@ class Orchestrator:
             dynamic_original = list(state["feedback"].dynamic_findings)
             if "comparison" not in state["validation_static_result"].artifacts:
                 state["validation_static_result"].artifacts["comparison"] = await self.issue_catalog.reconcile(
-                    str(self.config.repo_root),
+                    str(self._source_repo_root(state)),
                     state["run_id"],
                     static_original,
                     state["validation_static_result"].findings,
                 )
             if "comparison" not in state["validation_dynamic_result"].artifacts:
                 state["validation_dynamic_result"].artifacts["comparison"] = await self.issue_catalog.reconcile(
-                    str(self.config.repo_root),
+                    str(self._source_repo_root(state)),
                     state["run_id"],
                     dynamic_original,
                     state["validation_dynamic_result"].findings,
@@ -716,13 +1048,13 @@ class Orchestrator:
             ]
             dynamic_original = list(state["feedback"].dynamic_findings)
             static_comparison = await self.issue_catalog.reconcile(
-                str(self.config.repo_root),
+                str(self._source_repo_root(state)),
                 state["run_id"],
                 static_original,
                 state["validation_static_result"].findings,
             )
             dynamic_comparison = await self.issue_catalog.reconcile(
-                str(self.config.repo_root),
+                str(self._source_repo_root(state)),
                 state["run_id"],
                 dynamic_original,
                 state["validation_dynamic_result"].findings,
@@ -733,7 +1065,7 @@ class Orchestrator:
         report = WorkflowReport(
             run_id=state["run_id"],
             workflow_name="maintenance_loop",
-            repo_root=str(self.config.repo_root),
+            repo_root=str(self._source_repo_root(state)),
             started_at=state["started_at"],
             finished_at=datetime.now(timezone.utc),
             status=self._workflow_status(
@@ -748,7 +1080,10 @@ class Orchestrator:
             dynamic_result=state["dynamic_result"],
             maintenance_result=state["maintenance_result"],
             validation_results=validation_results,
+            report_dir=str(state.get("report_dir", "")),
+            metadata=self._environment_metadata(state.get("execution_environment")),
         )
+        report.metadata.update(await self._skill_report_metadata(state, report))
         report_dir = await self._write_report_artifacts(report)
         report.report_dir = str(report_dir)
         await self.state_store.finish_run(
@@ -761,21 +1096,24 @@ class Orchestrator:
 
     async def _node_persist_incident_report(self, state: WorkflowState) -> WorkflowState:
         await self.issue_catalog.record_findings(
-            str(self.config.repo_root),
+            str(self._source_repo_root(state)),
             state["run_id"],
             state["dynamic_result"].findings,
         )
         report = WorkflowReport(
             run_id=state["run_id"],
             workflow_name="incident_debug",
-            repo_root=str(self.config.repo_root),
+            repo_root=str(self._source_repo_root(state)),
             started_at=state["started_at"],
             finished_at=datetime.now(timezone.utc),
             status=state["dynamic_result"].status,
             snapshot=state["snapshot"],
             change_set=state["change_set"],
             dynamic_result=state["dynamic_result"],
+            report_dir=str(state.get("report_dir", "")),
+            metadata=self._environment_metadata(state.get("execution_environment")),
         )
+        report.metadata.update(await self._skill_report_metadata(state, report))
         report_dir = await self._write_report_artifacts(report)
         report.report_dir = str(report_dir)
         await self.state_store.finish_run(
@@ -800,13 +1138,13 @@ class Orchestrator:
             ]
             dynamic_original = list(state["feedback"].dynamic_findings)
             static_comparison = await self.issue_catalog.reconcile(
-                str(self.config.repo_root),
+                str(self._source_repo_root(state)),
                 state["run_id"],
                 static_original,
                 state["validation_static_result"].findings,
             )
             dynamic_comparison = await self.issue_catalog.reconcile(
-                str(self.config.repo_root),
+                str(self._source_repo_root(state)),
                 state["run_id"],
                 dynamic_original,
                 state["validation_dynamic_result"].findings,
@@ -820,7 +1158,9 @@ class Orchestrator:
             "publish_mode": state["publish_mode"].value,
             "publish_reasons": list(state.get("artifacts", {}).get("publish_reasons", [])),
         }
+        metadata.update(self._environment_metadata(state.get("execution_environment")))
         report = self._build_pr_report(state, metadata=metadata)
+        report.metadata.update(await self._skill_report_metadata(state, report))
         report_dir = await self._write_report_artifacts(report)
         report.report_dir = str(report_dir)
         artifact_references = self._artifact_references(report_dir, include_patch=bool(patch and patch.diff_text))
@@ -871,7 +1211,7 @@ class Orchestrator:
         return WorkflowReport(
             run_id=state["run_id"],
             workflow_name="pull_request_maintenance",
-            repo_root=str(self._resolve_task_root(state, validation=False)),
+            repo_root=str(self._source_repo_root(state)),
             started_at=state["started_at"],
             finished_at=datetime.now(timezone.utc),
             status=self._workflow_status(
@@ -886,15 +1226,9 @@ class Orchestrator:
             dynamic_result=state["dynamic_result"],
             maintenance_result=state["maintenance_result"],
             validation_results=validation_results,
+            report_dir=str(state.get("report_dir", "")),
             metadata=dict(metadata or {}),
         )
-
-    def _resolve_task_root(self, state: WorkflowState, *, validation: bool) -> Path:
-        if validation and "validation_workspace_root" in state:
-            return Path(state["validation_workspace_root"])
-        if "pr_repo_root" in state:
-            return Path(state["pr_repo_root"])
-        return self.config.repo_root
 
     async def _load_pr_publish_inputs(
         self,
@@ -921,6 +1255,8 @@ class Orchestrator:
             ArtifactReference(name="summary_md", path="summary.md"),
             ArtifactReference(name="report_json", path="report.json"),
             ArtifactReference(name="findings_json", path="findings.json"),
+            ArtifactReference(name="environment_json", path="artifacts/environment.json"),
+            ArtifactReference(name="install_log", path="artifacts/install.log"),
         ]
         if include_patch:
             references.append(ArtifactReference(name="patch_diff", path="patch.diff"))
@@ -961,8 +1297,8 @@ class Orchestrator:
         return ", ".join(parts)
 
     async def _write_report_artifacts(self, report: WorkflowReport) -> Path:
-        report_dir = self.config.reports_dir / report.run_id
-        await asyncio.to_thread(report_dir.mkdir, parents=True, exist_ok=True)
+        report_dir = Path(report.report_dir) if report.report_dir else self.config.reports_dir / report.run_id
+        await self.file_store.ensure_dir(report_dir)
         report.report_dir = str(report_dir)
         await write_markdown(report_dir / "summary.md", report)
         await write_json(report_dir / "report.json", report)
@@ -972,7 +1308,7 @@ class Orchestrator:
                 report_dir / "patch.diff",
                 report.maintenance_result.patch.diff_text,
             )
-        await asyncio.to_thread((report_dir / "artifacts").mkdir, exist_ok=True)
+        await self.file_store.ensure_dir(report_dir / "artifacts")
         return report_dir
 
 
@@ -1048,6 +1384,59 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Show the latest report path.",
     )
     report_parser.add_argument("--show", action="store_true", help="Print report markdown.")
+
+    skill_status_parser = subparsers.add_parser(
+        "skill-status",
+        parents=[common_parser],
+        help="Show active and candidate skill versions.",
+    )
+    skill_status_parser.add_argument(
+        "--agent",
+        choices=[item.value for item in AgentKind],
+        default=None,
+        help="Optional agent filter.",
+    )
+
+    skill_history_parser = subparsers.add_parser(
+        "skill-history",
+        parents=[common_parser],
+        help="Show recent skill evaluations.",
+    )
+    skill_history_parser.add_argument(
+        "--agent",
+        choices=[item.value for item in AgentKind],
+        required=True,
+        help="Agent whose skill evaluation history should be shown.",
+    )
+
+    skill_freeze_parser = subparsers.add_parser(
+        "skill-freeze",
+        parents=[common_parser],
+        help="Freeze or unfreeze an agent skill binding.",
+    )
+    skill_freeze_parser.add_argument(
+        "--agent",
+        choices=[item.value for item in AgentKind],
+        required=True,
+        help="Agent whose active skill binding should be updated.",
+    )
+    skill_freeze_parser.add_argument(
+        "--unfreeze",
+        action="store_true",
+        help="Unfreeze instead of freezing.",
+    )
+
+    skill_promote_parser = subparsers.add_parser(
+        "skill-promote",
+        parents=[common_parser],
+        help="Promote the current open candidate for an agent.",
+    )
+    skill_promote_parser.add_argument(
+        "--agent",
+        choices=[item.value for item in AgentKind],
+        required=True,
+        help="Agent whose candidate should be promoted.",
+    )
     return parser
 
 
@@ -1115,6 +1504,42 @@ async def main_async(argv: Iterable[str] | None = None) -> int:
                 summary_path = latest / "summary.md"
                 if summary_path.exists():
                     print(summary_path.read_text(encoding="utf-8"))
+            return 0
+        if args.command == "skill-status":
+            rows = await orchestrator.skill_manager.skill_status(config.repo_root)
+            if args.agent:
+                rows = [row for row in rows if row["agent"] == args.agent]
+            for row in rows:
+                print(
+                    f"{row['agent']}: active={row['active_version']} source={row['active_source']} "
+                    f"candidate={row['candidate_version'] or '-'} shadow_runs={row['candidate_shadow_runs']} "
+                    f"status={row['candidate_status'] or '-'} frozen={row['frozen']}"
+                )
+            return 0
+        if args.command == "skill-history":
+            history = await orchestrator.skill_manager.history(config.repo_root, AgentKind(args.agent))
+            for item in history:
+                print(
+                    f"{item['created_at']} run={item['run_id']} active={item['active_version']} "
+                    f"candidate={item['candidate_version'] or '-'} active_score={item['active_score']} "
+                    f"candidate_score={item['candidate_score']} promoted={item['promoted']} "
+                    f"reasons={','.join(item['reasons']) if item['reasons'] else '-'}"
+                )
+            return 0
+        if args.command == "skill-freeze":
+            await orchestrator.skill_manager.freeze(
+                config.repo_root,
+                AgentKind(args.agent),
+                frozen=not bool(args.unfreeze),
+            )
+            print(f"{args.agent}: {'unfrozen' if args.unfreeze else 'frozen'}")
+            return 0
+        if args.command == "skill-promote":
+            promoted = await orchestrator.skill_manager.manual_promote(
+                config.repo_root,
+                AgentKind(args.agent),
+            )
+            print(f"{args.agent}: {'promoted' if promoted else 'no-open-candidate'}")
             return 0
         return 1
     finally:

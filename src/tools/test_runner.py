@@ -11,5 +11,16 @@ class TestRunner:
     def __init__(self, runner: CommandRunner | None = None) -> None:
         self.runner = runner or CommandRunner()
 
-    async def run(self, command: str, repo_root: Path, timeout_seconds: int) -> CommandResult:
-        return await self.runner.run(command, cwd=repo_root, timeout_seconds=timeout_seconds)
+    async def run(
+        self,
+        command: str,
+        repo_root: Path,
+        timeout_seconds: int,
+        env: dict[str, str] | None = None,
+    ) -> CommandResult:
+        return await self.runner.run(
+            command,
+            cwd=repo_root,
+            timeout_seconds=timeout_seconds,
+            env=env,
+        )

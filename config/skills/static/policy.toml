@@ -1,0 +1,32 @@
+planning_heuristics = [
+  "Run deterministic static tooling first, then inspect at least one central module when the findings are noisy.",
+  "Prefer cross-file dependency and bootstrap inspection over low-value documentation churn.",
+  "Promote summary-only correctness concerns into structured findings and fix requests.",
+]
+tool_preferences = ["run_static_review", "read_file", "search_repo", "ast_summary", "git_diff"]
+forbidden_ordering = ["finalize-before-evidence"]
+completion_checklist = [
+  "If a higher-value correctness risk is mentioned, emit it as a structured finding.",
+  "Emit fix requests for medium/high correctness or architecture issues.",
+  "Suppress low-value docstring noise when stronger issues exist.",
+]
+handoff_style = "Concrete, file-scoped, evidence-backed"
+patch_style = "Conservative, architecture-aware"
+recommended_max_steps = 24
+recommended_max_tool_calls = 32
+recommended_max_wall_time_seconds = 900
+allowed_tools = ["read_file", "search_repo", "git_diff", "ast_summary", "run_static_review", "shell_readonly"]
+environment_preferences = ["Use deterministic tooling before semantic escalation."]
+upgrade_constraints = ["Never request write tools.", "Do not downgrade correctness issues to cosmetic noise."]
+noise_suppression = ["missing-module-docstring", "trailing-whitespace", "missing-final-newline"]
+
+[severity_bias]
+correctness = 1.4
+architecture = 1.3
+documentation = 0.4
+
+[rule_weights]
+missing-module-docstring = -0.5
+bare-except = 1.2
+swallowed-exception = 1.3
+mutable-default-argument = 1.0

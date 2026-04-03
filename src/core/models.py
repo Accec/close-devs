@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+import os
 from typing import TYPE_CHECKING, Any, TypedDict
 
 if TYPE_CHECKING:
@@ -57,6 +58,32 @@ class PublishMode(str, Enum):
     ARTIFACT_ONLY = "artifact_only"
 
 
+class AgentActionType(str, Enum):
+    TOOL_CALL = "tool_call"
+    FINALIZE = "finalize"
+
+
+class CompletionReason(str, Enum):
+    COMPLETED = "completed"
+    MAX_STEPS = "max_steps"
+    MAX_TOOL_CALLS = "max_tool_calls"
+    MAX_WALL_TIME = "max_wall_time"
+    MAX_CONSECUTIVE_FAILURES = "max_consecutive_failures"
+    FAILED = "failed"
+
+
+class SkillSource(str, Enum):
+    REPO = "repo"
+    DATABASE = "database"
+
+
+class SkillCandidateStatus(str, Enum):
+    CANDIDATE = "candidate"
+    PROMOTED = "promoted"
+    REJECTED = "rejected"
+    FROZEN = "frozen"
+
+
 def build_fingerprint(
     rule_id: str,
     path: str | None,
@@ -83,6 +110,38 @@ class RepoSnapshot:
     @property
     def files(self) -> list[str]:
         return sorted(self.file_hashes)
+
+
+@dataclass(slots=True)
+class ExecutionEnvironment:
+    report_dir: str
+    runtime_root: str
+    base_workspace_root: str
+    maintenance_workspace_root: str
+    validation_workspace_root: str
+    venv_root: str
+    python_bin: str
+    bin_dir: str
+    status: str = "ready"
+    detected_sources: list[str] = field(default_factory=list)
+    install_commands: list[str] = field(default_factory=list)
+    install_errors: list[str] = field(default_factory=list)
+    bootstrap_packages: list[str] = field(default_factory=list)
+    install_log_path: str | None = None
+    environment_json_path: str | None = None
+
+    @property
+    def degraded(self) -> bool:
+        return self.status == "degraded"
+
+    def command_env(self) -> dict[str, str]:
+        env = dict(os.environ)
+        current_path = env.get("PATH", "")
+        env["PATH"] = os.pathsep.join(
+            [self.bin_dir, current_path] if current_path else [self.bin_dir]
+        )
+        env["VIRTUAL_ENV"] = self.venv_root
+        return env
 
 
 @dataclass(slots=True)
@@ -132,6 +191,208 @@ class Finding:
                 self.symbol,
                 self.message,
             )
+
+
+@dataclass(slots=True)
+class EvidenceArtifact:
+    kind: str
+    title: str
+    summary: str
+    path: str | None = None
+    data: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class FixRequest:
+    source_agent: AgentKind
+    title: str
+    description: str
+    recommended_change: str
+    severity: Severity
+    affected_files: list[str] = field(default_factory=list)
+    evidence: list[EvidenceArtifact] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class SkillPolicy:
+    planning_heuristics: list[str] = field(default_factory=list)
+    tool_preferences: list[str] = field(default_factory=list)
+    forbidden_ordering: list[str] = field(default_factory=list)
+    severity_bias: dict[str, float] = field(default_factory=dict)
+    rule_weights: dict[str, float] = field(default_factory=dict)
+    command_preferences: list[str] = field(default_factory=list)
+    completion_checklist: list[str] = field(default_factory=list)
+    handoff_style: str = ""
+    patch_style: str = ""
+    recommended_max_steps: int | None = None
+    recommended_max_tool_calls: int | None = None
+    recommended_max_wall_time_seconds: int | None = None
+    allowed_tools: list[str] = field(default_factory=list)
+    environment_preferences: list[str] = field(default_factory=list)
+    upgrade_constraints: list[str] = field(default_factory=list)
+    noise_suppression: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class SkillPack:
+    agent_kind: AgentKind
+    name: str
+    version: str
+    description: str
+    status: str
+    source: SkillSource
+    system_prompt: str
+    skill_markdown: str
+    examples: list[dict[str, Any]] = field(default_factory=list)
+    policy: SkillPolicy = field(default_factory=SkillPolicy)
+    profile_hash: str = ""
+
+
+@dataclass(slots=True)
+class SkillBinding:
+    repo_root: str
+    agent_kind: AgentKind
+    active_version: str
+    source: SkillSource
+    frozen: bool = False
+    updated_at: datetime = field(default_factory=utc_now)
+
+
+@dataclass(slots=True)
+class SkillCandidate:
+    candidate_id: str
+    repo_root: str
+    agent_kind: AgentKind
+    based_on_version: str
+    version: str
+    skill_pack: SkillPack
+    status: SkillCandidateStatus = SkillCandidateStatus.CANDIDATE
+    created_at: datetime = field(default_factory=utc_now)
+    shadow_runs: int = 0
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class SkillEvaluation:
+    evaluation_id: str
+    repo_root: str
+    agent_kind: AgentKind
+    run_id: str
+    active_version: str
+    candidate_version: str | None
+    active_score: float
+    candidate_score: float | None
+    promoted: bool = False
+    reasons: list[str] = field(default_factory=list)
+    created_at: datetime = field(default_factory=utc_now)
+
+
+@dataclass(slots=True)
+class AgentReflection:
+    reflection_id: str
+    repo_root: str
+    run_id: str
+    task_id: str
+    session_id: str
+    agent_kind: AgentKind
+    skill_version: str
+    summary: str
+    metrics: dict[str, Any] = field(default_factory=dict)
+    upgrade_hints: list[str] = field(default_factory=list)
+    created_at: datetime = field(default_factory=utc_now)
+
+
+@dataclass(slots=True)
+class AgentMessage:
+    role: str
+    content: str
+    created_at: datetime = field(default_factory=utc_now)
+
+
+@dataclass(slots=True)
+class ToolPermissionSet:
+    allowed_tools: frozenset[str] = field(default_factory=frozenset)
+    allow_write: bool = False
+
+    def allows(self, tool_name: str) -> bool:
+        return tool_name in self.allowed_tools
+
+
+@dataclass(slots=True)
+class ToolSpec:
+    name: str
+    description: str
+    input_schema: dict[str, Any]
+    requires_write: bool = False
+
+
+@dataclass(slots=True)
+class ToolResult:
+    tool_name: str
+    ok: bool
+    output: dict[str, Any] = field(default_factory=dict)
+    summary: str = ""
+    error: str | None = None
+
+
+@dataclass(slots=True)
+class ToolCall:
+    step_index: int
+    tool_name: str
+    tool_input: dict[str, Any]
+    status: str
+    output: dict[str, Any] = field(default_factory=dict)
+    summary: str = ""
+    error: str | None = None
+    active_skill_version: str | None = None
+    candidate_skill_version: str | None = None
+    skill_profile_hash: str | None = None
+    started_at: datetime = field(default_factory=utc_now)
+    finished_at: datetime = field(default_factory=utc_now)
+
+
+@dataclass(slots=True)
+class AgentStep:
+    step_index: int
+    decision_summary: str
+    action_type: AgentActionType
+    tool_name: str | None = None
+    tool_input: dict[str, Any] = field(default_factory=dict)
+    final_response: dict[str, Any] = field(default_factory=dict)
+    created_at: datetime = field(default_factory=utc_now)
+
+
+@dataclass(slots=True)
+class AgentSession:
+    session_id: str
+    run_id: str
+    task_id: str
+    agent_kind: AgentKind
+    task_type: TaskType
+    working_repo_root: str
+    objective: str
+    targets: list[str]
+    payload: dict[str, Any]
+    messages: list[AgentMessage] = field(default_factory=list)
+    steps: list[AgentStep] = field(default_factory=list)
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    active_skill_version: str | None = None
+    candidate_skill_version: str | None = None
+    active_skill: SkillPack | None = None
+    candidate_skill: SkillCandidate | None = None
+    skill_profile_hash: str | None = None
+    completion_reason: CompletionReason | None = None
+    started_at: datetime = field(default_factory=utc_now)
+    finished_at: datetime | None = None
+
+    @property
+    def step_count(self) -> int:
+        return len(self.steps)
+
+    @property
+    def tool_call_count(self) -> int:
+        return len(self.tool_calls)
 
 
 @dataclass(slots=True)
@@ -285,6 +546,11 @@ class WorkflowState(TypedDict, total=False):
     run_id: str
     workflow_name: str
     started_at: datetime
+    execution_environment: ExecutionEnvironment
+    active_skills: dict[str, SkillPack]
+    candidate_skills: dict[str, SkillCandidate]
+    shadow_evaluation_summary: dict[str, Any]
+    skill_upgrade_events: list[dict[str, Any]]
     event_path: str
     pr_number_override: int
     snapshot: RepoSnapshot
@@ -357,3 +623,6 @@ class RunContext:
     state_store: "StateStore"
     logger: "logging.Logger"
     rules: dict[str, Any] = field(default_factory=dict)
+    execution_environment: ExecutionEnvironment | None = None
+    active_skill: SkillPack | None = None
+    candidate_skill: SkillCandidate | None = None

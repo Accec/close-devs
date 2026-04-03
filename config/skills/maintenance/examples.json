@@ -1,0 +1,7 @@
+[
+  {
+    "scenario": "safe-patch-bias",
+    "summary": "Prefer a single dependency declaration update over ten cosmetic module docstring changes when tests are blocked by a missing package.",
+    "suggestion": "Escalate unsupported blockers if the current safe-fix policy cannot address them."
+  }
+]

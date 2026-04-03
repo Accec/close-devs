@@ -4,6 +4,7 @@ state_dir = "state"
 reports_dir = "reports"
 scan_interval_minutes = 60
 log_level = "INFO"
+log_agent_activity = true
 auto_apply_patch = false
 rules_path = "config/rules.toml"
 include = ["*.py", "**/*.py", "pyproject.toml", "README.md"]
@@ -18,9 +19,9 @@ exclude = [
 ]
 
 [llm]
-provider = "mock"
-model = "close-devs-mock"
-base_url = ""
+provider = "openai_compatible"
+model = "gpt-5.4"
+base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
 timeout_seconds = 30
 temperature = 0.0
@@ -58,3 +59,101 @@ backend = "postgres"
 url = "postgres://close_devs:close_devs@127.0.0.1:5432/close_devs"
 url_env = "DATABASE_URL"
 echo = false
+
+[environment]
+enabled = true
+scope = "all_analysis"
+install_mode = "auto_detect"
+install_fail_policy = "mark_degraded"
+python_executable = "python3"
+bootstrap_tools = true
+
+[skills]
+enabled = true
+repo_root = "config/skills"
+shadow_evaluation_enabled = true
+min_shadow_runs = 5
+promotion_margin = 0.10
+
+[skills.static]
+baseline = "baseline"
+auto_upgrade = true
+
+[skills.dynamic]
+baseline = "baseline"
+auto_upgrade = true
+
+[skills.maintenance]
+baseline = "baseline"
+auto_upgrade = true
+
+[agents.static]
+model = "gpt-5.4"
+max_steps = 24
+max_tool_calls = 32
+max_wall_time_seconds = 900
+max_consecutive_failures = 3
+max_budget_ceiling = 24
+safety_lock = true
+allowed_tools = [
+  "read_file",
+  "search_repo",
+  "git_diff",
+  "ast_summary",
+  "run_static_review",
+  "shell_readonly",
+]
+allowed_tool_superset = [
+  "read_file",
+  "search_repo",
+  "git_diff",
+  "ast_summary",
+  "run_static_review",
+  "shell_readonly",
+]
+
+[agents.dynamic]
+model = "gpt-5.4"
+max_steps = 32
+max_tool_calls = 40
+max_wall_time_seconds = 1200
+max_consecutive_failures = 4
+max_budget_ceiling = 32
+safety_lock = true
+allowed_tools = [
+  "read_file",
+  "search_repo",
+  "run_test_command",
+  "parse_traceback",
+  "shell_readonly",
+]
+allowed_tool_superset = [
+  "read_file",
+  "search_repo",
+  "run_test_command",
+  "parse_traceback",
+  "shell_readonly",
+]
+
+[agents.maintenance]
+model = "gpt-5.4"
+max_steps = 40
+max_tool_calls = 48
+max_wall_time_seconds = 1500
+max_consecutive_failures = 4
+max_budget_ceiling = 40
+safety_lock = true
+allowed_tools = [
+  "read_file",
+  "search_repo",
+  "git_diff",
+  "prepare_safe_patch",
+  "write_file",
+]
+allowed_tool_superset = [
+  "read_file",
+  "search_repo",
+  "git_diff",
+  "prepare_safe_patch",
+  "write_file",
+]

@@ -35,6 +35,13 @@ where = ["src"]
 markers = [
   "postgres: integration tests requiring dockerized PostgreSQL",
 ]
+norecursedirs = [
+  "reports",
+  "state",
+  ".venv",
+  ".git",
+  "__pycache__",
+]
 
 [tool.aerich]
 tortoise_orm = "memory.database.TORTOISE_ORM"

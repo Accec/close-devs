@@ -7,6 +7,9 @@ import tempfile
 
 
 class FileStore:
+    async def ensure_dir(self, path: Path) -> None:
+        await asyncio.to_thread(path.mkdir, parents=True, exist_ok=True)
+
     async def read_text(self, path: Path) -> str:
         return await asyncio.to_thread(path.read_text, encoding="utf-8")
 
@@ -17,15 +20,33 @@ class FileStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
 
-    async def materialize_workspace_copy(self, repo_root: Path) -> Path:
-        return await asyncio.to_thread(self._materialize_workspace_copy_sync, repo_root)
-
-    def _materialize_workspace_copy_sync(self, repo_root: Path) -> Path:
-        tmp_dir = Path(tempfile.mkdtemp(prefix="close_devs_validation_"))
-        destination = tmp_dir / repo_root.name
-        shutil.copytree(
+    async def materialize_workspace_copy(
+        self,
+        repo_root: Path,
+        *,
+        destination: Path | None = None,
+    ) -> Path:
+        return await asyncio.to_thread(
+            self._materialize_workspace_copy_sync,
             repo_root,
             destination,
+        )
+
+    def _materialize_workspace_copy_sync(
+        self,
+        repo_root: Path,
+        destination: Path | None = None,
+    ) -> Path:
+        target = destination
+        if target is None:
+            tmp_dir = Path(tempfile.mkdtemp(prefix="close_devs_validation_"))
+            target = tmp_dir / repo_root.name
+        if target.exists():
+            shutil.rmtree(target)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(
+            repo_root,
+            target,
             ignore=shutil.ignore_patterns(
                 ".git",
                 ".venv",
@@ -36,4 +57,4 @@ class FileStore:
                 ".mypy_cache",
             ),
         )
-        return destination
+        return target

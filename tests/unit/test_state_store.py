@@ -21,6 +21,12 @@ from tests.support import sqlite_database_config
 
 
 @pytest.mark.asyncio
+async def test_state_store_requires_initialized_schema_when_not_ensuring_schema(tmp_path: Path) -> None:
+    with pytest.raises(RuntimeError, match="aerich upgrade"):
+        await StateStore.create(sqlite_database_config(tmp_path), ensure_schema=False)
+
+
+@pytest.mark.asyncio
 async def test_state_store_persists_snapshot_and_task(tmp_path: Path) -> None:
     store = await StateStore.create(sqlite_database_config(tmp_path), ensure_schema=True)
     try:
