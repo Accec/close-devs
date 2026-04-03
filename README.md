@@ -12,6 +12,17 @@ incremental changes, run static and dynamic analysis concurrently, generate
 maintenance patches, validate those patches in an isolated workspace, and
 persist the full run history in PostgreSQL via Tortoise ORM.
 
+Each of the three agents now runs as an autonomous session rather than a
+single-shot helper:
+
+- `StaticReviewAgent` explores code, tools, and local context within a read-only tool budget
+- `DynamicDebugAgent` iterates on repro commands, test runs, and traceback analysis within a read-only execution budget
+- `MaintenanceAgent` consumes upstream handoffs and is the only agent allowed to write repository files
+
+The supervisor remains deterministic, but the work inside each agent is now
+session-based: tool calls, handoffs, completion reasons, and agent summaries are
+persisted as first-class runtime records.
+
 ## Quick Start
 
 ```bash
@@ -22,6 +33,23 @@ docker compose up -d postgres
 aerich upgrade
 python main.py run-once --config config/default.toml --repo .
 ```
+
+## Further Reading
+
+For day-to-day operation, configuration, report interpretation, skill
+management, and troubleshooting, use the full guides:
+
+- English: [GUIDE.en.md](GUIDE.en.md)
+- 中文: [GUIDE.zh-CN.md](GUIDE.zh-CN.md)
+
+Use the guides if you are:
+
+- operating Close-Devs against a real repository
+- tuning agent behavior, skills, or runtime budgets
+- debugging isolated environments, reports, PR publishing, or database setup
+
+This README stays intentionally short and focuses on project overview and quick
+start.
 
 ## GitHub PR Workflow
 
@@ -62,11 +90,34 @@ PR publishing is two-phase by default:
 ## Design Principles
 
 - Three core agents only
-- Deterministic orchestration and state persistence
+- Deterministic supervision with autonomous agent sessions
 - Async orchestration with LangGraph
 - Standard library first
 - Patch proposal mode by default
 - Long-term repository memory via PostgreSQL, SQLite compatibility, and report artifacts
+- Strict write boundary: only `MaintenanceAgent` can modify files
+
+## Agentic Runtime
+
+Close-Devs now uses a shared `AgentKernel` for all three agents. The kernel
+handles:
+
+- multi-step session loops
+- typed tool invocation
+- per-agent budgets
+- permission checks
+- completion reasons
+- session persistence
+
+Per-agent runtime limits and allowed toolsets are configured in
+`config/default.toml`:
+
+- `[agents.static]`
+- `[agents.dynamic]`
+- `[agents.maintenance]`
+
+Each section controls `model`, `max_steps`, `max_tool_calls`,
+`max_wall_time_seconds`, `max_consecutive_failures`, and `allowed_tools`.
 
 ## LLM Providers
 
@@ -83,6 +134,9 @@ Each run writes:
 - `reports/<run_id>/report.json`
 - `reports/<run_id>/patch.diff`
 - `reports/<run_id>/artifacts/`
+
+`summary.md` also includes agent session summaries such as step count, tool call
+count, completion reason, and handoff count.
 
 ## Database Backends
 

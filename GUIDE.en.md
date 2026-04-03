@@ -1,57 +1,178 @@
 # Close-Devs Guide
 
-## Overview
+## 1. What Close-Devs Is
 
 Close-Devs is a Python 3.11+ repository maintenance system built around exactly
 three core agents:
 
-- `MaintenanceAgent`
 - `StaticReviewAgent`
 - `DynamicDebugAgent`
+- `MaintenanceAgent`
 
-It uses `asyncio`, `LangGraph`, and `Tortoise ORM` to scan a repository,
-analyze code, generate safe maintenance patches, validate those patches, and
-persist run history.
+It is designed for long-term repository maintenance rather than one-off tasks.
+The system continuously scans a repository, runs static and dynamic analysis,
+generates safe maintenance patches, validates those patches, persists run
+history, and publishes results locally or through GitHub PR workflows.
 
-## Project Layout
+Close-Devs is not a "four-agent" design. The `Orchestrator` is a deterministic
+supervisor and workflow runner, not a fourth autonomous agent.
 
-The source tree is flattened under `src/`:
+## 2. Architecture and Runtime Model
 
-- `src/agents`: the three core agents
-- `src/core`: orchestration, CLI, models, dispatcher, scheduler
-- `src/tools`: reusable utilities such as patching, command execution, static tooling
-- `src/workflows`: workflow entrypoints
-- `src/memory`: database and run history persistence
-- `src/github`: GitHub PR publishing and rendering
-- `src/repo`: repository scanning and change detection
-- `src/reports`: report serialization and markdown rendering
+The runtime model is:
 
-Entry point:
+- deterministic supervision
+- autonomous agent sessions
+- isolated per-run execution environments
+- PostgreSQL-first persistence with SQLite compatibility
 
-- `main.py`
+At a high level, a normal maintenance run looks like this:
 
-Default configuration:
+1. Close-Devs scans the repository and computes the change set.
+2. `StaticReviewAgent` and `DynamicDebugAgent` run in parallel.
+3. Their findings and handoffs are merged into a maintenance task.
+4. `MaintenanceAgent` decides what to inspect and produces a patch proposal.
+5. Validation static and dynamic tasks run against the patched validation workspace.
+6. Reports, findings, patches, skill metadata, and run history are persisted.
 
-- `config/default.toml`
+Each agent runs a multi-step session, not a single helper call. Within its
+budget, an agent decides:
 
-GitHub Actions workflow:
+- what files to inspect
+- which typed tools to call
+- what evidence to keep
+- when enough evidence exists to finalize
 
-- `.github/workflows/close-devs-pr.yml`
+The current implementation uses:
 
-## Requirements
+- `asyncio` for async orchestration
+- `LangGraph` for workflow graphs
+- `Tortoise ORM` for persistence
+- `Aerich` for database migrations
 
-- Python `3.11+`
-- Git
-- Docker, if you want the default PostgreSQL runtime locally
+## 3. Three Agents and Their Boundaries
 
-Optional but recommended external tools:
+### `StaticReviewAgent`
 
-- `ruff`
-- `mypy`
-- `bandit`
-- `pytest`
+Responsibilities:
 
-## Quick Start
+- deterministic static tooling
+- semantic code review
+- architecture and correctness observations
+- structured `finding` and `handoff` generation
+
+It can:
+
+- read files
+- search the repository
+- inspect diffs
+- build AST summaries
+- run static tools such as `ruff`, `mypy`, and `bandit`
+
+It cannot:
+
+- write files
+- modify the repository
+- run runtime mutation steps as if it were a debugger
+
+### `DynamicDebugAgent`
+
+Responsibilities:
+
+- execute test and repro commands
+- collect stderr/stdout and runtime evidence
+- parse failures and tracebacks
+- generate runtime-oriented fix requests
+
+It can:
+
+- run test commands
+- parse traceback text
+- inspect relevant files and logs
+- iteratively refine diagnosis within its budget
+
+It cannot:
+
+- write files
+- patch the repository
+- act as the final static standards authority
+
+### `MaintenanceAgent`
+
+Responsibilities:
+
+- consume upstream findings and handoffs
+- inspect impacted files
+- generate safe patch proposals
+- prepare code changes inside the maintenance workspace
+
+It can:
+
+- read files
+- inspect diffs
+- prepare safe patches
+- write files inside the maintenance workspace
+
+It cannot:
+
+- replace static review as the final static judgment
+- replace dynamic debug as the final runtime diagnosis
+- implicitly gain push/commit authority
+
+Only `MaintenanceAgent` is allowed to write repository content, and even then it
+writes to the report-local maintenance workspace by default. It does not write
+back to the original repository unless `auto_apply_patch = true`.
+
+## 4. Execution Environment and Isolated Runtime
+
+Every run creates an isolated runtime under:
+
+`reports/<run_id>/runtime/`
+
+The layout is:
+
+- `base_workspace/<repo_name>`
+- `maintenance_workspace/<repo_name>`
+- `validation_workspace/<repo_name>`
+- `.venv`
+
+Meaning:
+
+- `base_workspace` is the initial analysis copy of the target repo
+- `maintenance_workspace` is the writable workspace used by `MaintenanceAgent`
+- `validation_workspace` is the copy used for validation after patching
+- `.venv` is the report-local virtual environment used for analysis and validation
+
+This matters because Close-Devs does not primarily trust the host environment.
+Static checks, test runs, and validation are intended to run against the
+report-local environment first.
+
+### Dependency auto-detection
+
+Dependency installation is currently auto-detected in this order:
+
+1. `src/requirements.txt`
+2. `requirements.txt`
+3. `requirements-dev.txt`
+4. `requirements-test.txt`
+5. `pyproject.toml:project.dependencies`
+
+If dependencies are found, Close-Devs will:
+
+1. create a report-local venv
+2. upgrade `pip`, `setuptools`, and `wheel`
+3. install detected project dependencies
+4. install analysis bootstrap tools such as `ruff`, `mypy`, `bandit`, and `pytest`
+
+If installation fails, the run is marked `degraded`, but the workflow continues.
+The degraded state is recorded in the report instead of silently falling back to
+the host environment.
+
+## 5. Installation and First Run
+
+### PostgreSQL main path
+
+Use this path if you want the default production-like local setup:
 
 ```bash
 python3 -m venv .venv
@@ -62,53 +183,340 @@ aerich upgrade
 python main.py run-once --config config/default.toml --repo .
 ```
 
-## CLI Commands
+### SQLite lightweight local path
 
-### Local maintenance loop
+Use this when you want fast local runs without Docker:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e '.[dev]'
+export DATABASE_URL=sqlite:////tmp/close_devs_local.db
+python main.py run-once --config config/default.toml --repo .
+```
+
+This works because Close-Devs reads `DATABASE_URL` first and can infer the
+backend from the DSN.
+
+### First-run expectations
+
+A successful first run should:
+
+- create a database run record
+- create `reports/<run_id>/`
+- create `reports/<run_id>/runtime/.venv`
+- produce `summary.md`, `report.json`, `findings.json`
+- optionally produce `patch.diff`
+
+## 6. Configuration Reference
+
+The primary runtime configuration lives in:
+
+- `config/default.toml`
+
+### `[app]`
+
+Controls:
+
+- target repo root
+- state directory
+- reports directory
+- scan interval
+- log level
+- whether agent activity logging is enabled
+- whether generated patches are auto-applied to the source repo
+- include and exclude patterns
+
+Important fields:
+
+- `repo_root`
+- `reports_dir`
+- `log_level`
+- `log_agent_activity`
+- `auto_apply_patch`
+- `rules_path`
+- `include`
+- `exclude`
+
+### `[llm]`
+
+Controls the model provider used by all agent runtimes unless overridden by
+per-agent config.
+
+Important fields:
+
+- `provider = "mock" | "openai_compatible"`
+- `model`
+- `base_url`
+- `api_key_env`
+- `timeout_seconds`
+- `temperature`
+- `system_prompt`
+
+If the configured API key env var is missing, Close-Devs falls back to
+`mock` and logs a warning.
+
+### `[static_review]`
+
+Controls static tool behavior:
+
+- `max_complexity`
+- `ruff_command`
+- `mypy_command`
+- `bandit_command`
+
+### `[dynamic_debug]`
+
+Controls runtime command behavior:
+
+- `smoke_commands`
+- `test_commands`
+- `timeout_seconds`
+
+### `[database]`
+
+Controls persistence backend:
+
+- `backend = "postgres" | "sqlite"`
+- `url`
+- `url_env`
+- `echo`
+
+`DATABASE_URL` is the normal override path for local development, CI, and
+one-off debugging.
+
+### `[environment]`
+
+Controls report-local isolated runtime creation:
+
+- `enabled`
+- `scope`
+- `install_mode`
+- `install_fail_policy`
+- `python_executable`
+- `bootstrap_tools`
+
+Current defaults mean:
+
+- environment isolation is enabled
+- it applies to all analysis
+- dependency installation is auto-detected
+- failures mark the run as degraded instead of failing fast
+
+### `[skills]`
+
+Controls the repo skill system and shadow self-upgrade:
+
+- `enabled`
+- `repo_root`
+- `shadow_evaluation_enabled`
+- `min_shadow_runs`
+- `promotion_margin`
+
+### `[skills.static]`, `[skills.dynamic]`, `[skills.maintenance]`
+
+Each agent skill section currently controls:
+
+- `baseline`
+- `auto_upgrade`
+
+### `[agents.static]`, `[agents.dynamic]`, `[agents.maintenance]`
+
+These sections define hard runtime ceilings and tool permissions for each
+agent.
+
+Important fields:
+
+- `model`
+- `max_steps`
+- `max_tool_calls`
+- `max_wall_time_seconds`
+- `max_consecutive_failures`
+- `max_budget_ceiling`
+- `safety_lock`
+- `allowed_tools`
+- `allowed_tool_superset`
+
+Important rule:
+
+- skills can optimize within these bounds
+- skills cannot break these bounds
+
+### `[github]`
+
+Controls PR workflow publishing behavior:
+
+- provider and repo context
+- token env var
+- fix branch prefix
+- review mode
+- artifact retention
+
+### `[pr_workflow]`
+
+Controls PR publishing policy:
+
+- inline comment limit
+- whether companion PRs are allowed
+- safe-fix-only mode
+- issue comment rerun trigger
+
+## 7. Local CLI Workflows
+
+All public local entrypoints currently come from `main.py`.
+
+### `run-once`
 
 ```bash
 python main.py run-once --config config/default.toml --repo .
 ```
 
-Runs the full maintenance workflow:
+Use when:
 
-1. scan repository
-2. run static review
-3. run dynamic debug
-4. generate maintenance patch proposal
-5. validate the patch
-6. write reports
+- you want the full maintenance loop
+- you want static, dynamic, maintenance, and validation in one run
 
-### Repository scan only
+Main effects:
+
+- creates a run record
+- creates a report-local environment
+- runs the full graph
+- writes a report directory
+
+### `scan`
 
 ```bash
 python main.py scan --config config/default.toml --repo .
 ```
 
-### Static review only
+Use when:
+
+- you only want repository scan counts
+- you want to verify include/exclude behavior
+
+Main output:
+
+- tracked file count
+- changed file count
+- added/removed file count
+
+### `review`
 
 ```bash
 python main.py review --config config/default.toml --repo .
 ```
 
-### Dynamic debug only
+Use when:
+
+- you only want static review behavior
+- you are tuning static rules or static skills
+
+Main output:
+
+- a static-review-only report
+- findings and skill metadata
+
+### `debug`
 
 ```bash
 python main.py debug --config config/default.toml --repo .
 ```
 
-### Show latest report
+Use when:
+
+- you only want runtime diagnosis
+- you are tuning repro commands or dynamic skills
+
+Main output:
+
+- a dynamic-debug-only report
+
+### `report`
 
 ```bash
 python main.py report --config config/default.toml --repo .
 python main.py report --config config/default.toml --repo . --show
 ```
 
-## GitHub PR Workflow
+Use when:
+
+- you want the latest report directory
+- you want to print the latest markdown summary to the terminal
+
+### `skill-status`
+
+```bash
+python main.py skill-status --config config/default.toml --repo .
+python main.py skill-status --config config/default.toml --repo . --agent static_review
+```
+
+Use when:
+
+- you want to see the active skill version for each agent
+- you want to know whether a candidate exists
+- you want to see whether a binding is frozen
+
+Main output includes:
+
+- active version
+- source
+- candidate version
+- shadow run count
+- candidate status
+- frozen state
+
+### `skill-history`
+
+```bash
+python main.py skill-history --config config/default.toml --repo . --agent static_review
+```
+
+Use when:
+
+- you want recent evaluation records for one agent
+
+Main output includes:
+
+- run id
+- active version
+- candidate version
+- active score
+- candidate score
+- whether promotion happened
+- recorded reasons
+
+### `skill-freeze`
+
+```bash
+python main.py skill-freeze --config config/default.toml --repo . --agent maintenance
+python main.py skill-freeze --config config/default.toml --repo . --agent maintenance --unfreeze
+```
+
+Use when:
+
+- you want to stop automatic promotion for an agent
+- you want to re-enable automatic promotion later
+
+### `skill-promote`
+
+```bash
+python main.py skill-promote --config config/default.toml --repo . --agent dynamic_debug
+```
+
+Use when:
+
+- you want to manually promote the current open candidate
+
+Effect:
+
+- updates the DB binding pointer if an open candidate exists
+- does not rewrite the repo skill pack files
+
+## 8. GitHub PR Workflows
 
 Close-Devs uses a two-phase PR workflow.
 
-### Phase 1: analyze PR
+### Phase 1: `pr-review`
 
 ```bash
 python main.py pr-review \
@@ -117,16 +525,21 @@ python main.py pr-review \
   --repo "$GITHUB_WORKSPACE"
 ```
 
-This phase:
+Use when:
+
+- a GitHub Actions job needs to analyze a PR
+- you want a report and publish context, but not publishing yet
+
+Main effects:
 
 - loads PR context
-- scans changed files
-- runs static and dynamic analysis
-- builds a maintenance patch proposal
-- validates the patch
-- writes `report.json` and `artifacts/publish_context.json`
+- scans PR repo state
+- runs static and dynamic agents
+- runs maintenance and validation
+- writes report artifacts
+- writes `artifacts/publish_context.json`
 
-### Phase 2: publish PR results
+### Phase 2: `pr-publish`
 
 ```bash
 python main.py pr-publish \
@@ -136,117 +549,393 @@ python main.py pr-publish \
   --repo "$GITHUB_WORKSPACE"
 ```
 
-This phase:
+Use when:
 
-- resolves GitHub Actions artifact URLs
-- updates one stable Close-Devs top-level PR comment
-- publishes conservative inline comments when eligible
-- opens or updates a companion PR for safe autofixes when publishable
+- the report artifact has already been uploaded
+- you want to publish summary comment, artifact links, inline comments, and
+  optional companion PR output
 
-## Reports and Artifacts
+Main effects:
 
-Each run writes a directory under `reports/<run_id>/`:
+- resolves artifact URLs
+- updates one stable Close-Devs summary comment
+- optionally publishes conservative inline comments
+- optionally opens or updates a companion PR
 
-- `summary.md`
-- `findings.json`
-- `report.json`
-- `patch.diff`
-- `artifacts/`
+### PR publish modes
 
-For PR workflows, `artifacts/` also includes:
+Current publish modes are:
 
-- `publish_context.json`
-- `review_payload.json` after `pr-publish`
+- `companion_pr`
+- `comment_only`
+- `artifact_only`
 
-## Configuration
+Close-Devs degrades automatically when:
 
-The main sections in `config/default.toml` are:
+- the token is missing
+- permissions are insufficient
+- the PR comes from a fork
+- validation makes the patch non-publishable
 
-- `[app]`: repo root, report paths, include/exclude rules
-- `[llm]`: `mock` or `openai_compatible`
-- `[static_review]`: commands for `ruff`, `mypy`, `bandit`
-- `[dynamic_debug]`: smoke and test commands
-- `[github]`: branch prefix, token env, review mode, artifact retention
-- `[pr_workflow]`: inline comment limit, companion PR enablement, safe-fix behavior
-- `[database]`: backend and DSN
+## 9. Skill System and Shadow Self-Upgrade
 
-Important default behavior:
+The repo skill system is one of the main runtime controls for agent behavior.
 
-- default database backend: PostgreSQL
-- environment variable `DATABASE_URL` overrides the DSN in config
-- `auto_apply_patch = false` by default
-- local LLM mode defaults to `mock`
+Baseline skill packs live in:
 
-## Database Notes
+- `config/skills/static/`
+- `config/skills/dynamic/`
+- `config/skills/maintenance/`
 
-Default path:
+Each pack currently contains:
 
-- PostgreSQL via Docker Compose
+- `manifest.toml`
+- `policy.toml`
+- `skill.md`
+- `examples.json`
 
-Compatibility path:
+### What a skill pack controls
 
-- SQLite for lightweight local development or test runs
+A skill pack defines behavior such as:
 
-Migrations:
+- prompt guidance
+- planning heuristics
+- tool preference
+- severity and prioritization bias
+- handoff style
+- completion checklist
+- reflection and upgrade hint style
+
+### Active skill vs candidate skill
+
+- The repo baseline skill is the versioned source-of-truth template in git.
+- The active skill is the version currently bound in the database.
+- A candidate skill is a proposed next version stored in the database.
+
+The active binding can override the baseline selection without rewriting repo
+files.
+
+### Shadow evaluation
+
+Shadow evaluation means:
+
+- production runs still use the active skill
+- candidate skills are evaluated alongside active behavior using deterministic
+  scoring
+- promotion only happens after enough shadow runs and sufficient improvement
+
+Current promotion controls come from `[skills]`:
+
+- `min_shadow_runs`
+- `promotion_margin`
+
+### Safety boundaries
+
+Skills cannot:
+
+- give `StaticReviewAgent` write access
+- give `DynamicDebugAgent` write access
+- give `MaintenanceAgent` default push/commit authority
+- break hard ceilings defined in `[agents.*]`
+
+Skills can:
+
+- change preferred tool order
+- change prioritization
+- change handoff style
+- recommend smaller budgets within the hard ceiling
+
+### How to operate the skill system
+
+Use:
+
+- `skill-status` to inspect current state
+- `skill-history` to review evaluation records
+- `skill-freeze` to stop automatic promotion
+- `skill-promote` to manually activate an open candidate
+
+## 10. Reports, Artifacts, and How to Read Them
+
+Each run writes:
+
+- `reports/<run_id>/summary.md`
+- `reports/<run_id>/report.json`
+- `reports/<run_id>/findings.json`
+- `reports/<run_id>/patch.diff`
+- `reports/<run_id>/artifacts/`
+
+### Main report artifacts
+
+#### `summary.md`
+
+Human-readable report overview. It currently includes:
+
+- workflow metadata
+- execution environment status
+- agent skills summary
+- static review result
+- dynamic debug result
+- maintenance result
+- validation results
+
+#### `report.json`
+
+Machine-readable full workflow report, including metadata and agent result
+artifacts.
+
+#### `findings.json`
+
+Flattened findings across the run.
+
+#### `patch.diff`
+
+Unified diff for the maintenance patch proposal when a patch exists.
+
+#### `artifacts/environment.json`
+
+Machine-readable summary of the isolated runtime:
+
+- runtime paths
+- dependency sources
+- install commands
+- install failures
+- whether the environment is degraded
+
+#### `artifacts/install.log`
+
+Raw install transcript for venv/bootstrap/dependency installation.
+
+#### PR-only artifacts
+
+PR workflows may also produce:
+
+- `artifacts/publish_context.json`
+- `artifacts/review_payload.json`
+
+### How to read workflow status correctly
+
+Important interpretation rule:
+
+- `Status: succeeded` means the workflow executed successfully
+- it does **not** automatically mean the repository has been fixed
+
+You must also inspect:
+
+- static findings
+- dynamic findings
+- maintenance patch output
+- validation results
+
+### How to tell whether a problem is unresolved
+
+A run likely did not fix the main issue when:
+
+- `dynamic_validation` still reports the original blocker
+- `maintenance` produced only low-risk cosmetic patches
+- `validation` still contains high-severity findings
+- the report mentions `regressed` or unresolved comparisons
+
+### How to tell whether real AI ran
+
+Look for these signals:
+
+- startup logs do **not** say `Falling back to mock`
+- `client=OpenAICompatibleLLMClient` appears in runtime logs
+- summaries and handoffs contain model-driven reasoning rather than only
+  deterministic tool output
+
+If you see a fallback warning, the run used `mock`.
+
+## 11. Logging and Agent Activity
+
+Close-Devs can log agent activity in detail when:
+
+- `[app].log_agent_activity = true`
+
+Common log events:
+
+- `Task dispatched`
+- `Session started`
+- `Step decided`
+- `Tool started`
+- `Tool finished`
+- `Session finalizing`
+- `Session finished`
+- `Task finished`
+
+These logs help you answer:
+
+- which agent ran
+- which model client it used
+- which tools it called
+- how many steps it took
+- whether it hit budget or finished normally
+
+### Interpreting agent logs
+
+Example interpretation:
+
+- `Task dispatched`: the supervisor handed a task to an agent
+- `Session started`: the autonomous session is live with a specific budget and toolset
+- `Step decided`: the agent chose its next action
+- `Tool started`: the selected tool call began
+- `Tool finished`: the tool returned with success or failure
+- `Session finished`: the agent completed, exhausted budget, or errored
+
+## 12. Database and Migrations
+
+Close-Devs is PostgreSQL-first, with SQLite compatibility.
+
+### PostgreSQL path
+
+Use PostgreSQL when:
+
+- running locally in the default configuration
+- running CI
+- running PR workflows
+- keeping richer long-term history
+
+Setup:
+
+```bash
+docker compose up -d postgres
+aerich upgrade
+```
+
+### SQLite path
+
+Use SQLite when:
+
+- you want fast local smoke tests
+- you do not want to run Docker
+- you want disposable single-user runs
+
+Example:
+
+```bash
+export DATABASE_URL=sqlite:////tmp/close_devs_local.db
+python main.py run-once --config config/default.toml --repo .
+```
+
+### Migration rule
+
+If the database exists but the tables do not, run:
 
 ```bash
 aerich upgrade
 ```
 
-## What the Three Agents Do
-
-### `StaticReviewAgent`
-
-- static analysis only
-- no code execution
-- no patch writing
-
-### `DynamicDebugAgent`
-
-- runtime execution, tests, logs, tracebacks
-- no static governance decision
-- no patch writing
-
-### `MaintenanceAgent`
-
-- patch generation and safe autofix only
-- no final static review judgment
-- no runtime diagnosis
-
-## Common Local Workflow
-
-When developing Close-Devs itself:
-
-1. run `python main.py run-once --config config/default.toml --repo .`
-2. inspect the latest report
-3. run `pytest`
-4. adjust config or workflow behavior
-5. rerun
-
-## Troubleshooting
+## 13. Troubleshooting
 
 ### PostgreSQL connection refused
 
-- make sure Docker is running
-- start PostgreSQL with `docker compose up -d postgres`
-- verify `DATABASE_URL`
+Symptoms:
 
-### `pr-publish` cannot find artifacts
+- startup fails while connecting to `127.0.0.1:5432`
 
-- make sure `pr-review` ran first
-- make sure the workflow uploaded the report directory
-- verify the `publish_context.json` path
+Fix:
 
-### No comment posted back to GitHub
+```bash
+docker compose up -d postgres
+aerich upgrade
+```
 
-- verify `GITHUB_TOKEN`
-- check whether the PR comes from a fork
-- inspect the workflow logs for capability degradation to `artifact_only`
+Also check whether `DATABASE_URL` is overriding the default DSN.
 
-## Recommended Reading Order
+### `aerich upgrade` has not been run
 
-1. `README.md`
-2. `GUIDE.en.md` or `GUIDE.zh-CN.md`
-3. `config/default.toml`
-4. `src/core/orchestrator.py`
-5. `.github/workflows/close-devs-pr.yml`
+Symptoms:
+
+- errors mentioning missing tables such as `runs` or `aerich`
+
+Fix:
+
+```bash
+aerich upgrade
+```
+
+### Missing `OPENAI_API_KEY`
+
+Symptoms:
+
+- log warning says Close-Devs fell back to `mock`
+
+Fix:
+
+```bash
+export OPENAI_API_KEY=your_key
+```
+
+Then rerun the command.
+
+### Report-local environment is degraded
+
+Symptoms:
+
+- `Execution Environment` says `degraded`
+- `install_failures` is non-zero
+- tests or tools fail due to missing packages
+
+What to inspect:
+
+- `artifacts/environment.json`
+- `artifacts/install.log`
+
+Typical causes:
+
+- bad dependency file
+- private dependency access failure
+- unsupported dependency layout
+
+### `pr-publish` cannot find artifact or cannot update comments
+
+Symptoms:
+
+- publish phase cannot resolve artifact URLs
+- PR summary comment is not updated
+
+Check:
+
+- GitHub Actions uploaded the run artifact
+- `GITHUB_TOKEN` is present
+- the token has comment/publish permissions
+- the `publish_context.json` path is correct
+
+### SQLite says `database is locked`
+
+Symptoms:
+
+- local SQLite runs fail with `database is locked`
+
+Common reason:
+
+- multiple processes are using the same SQLite file concurrently
+
+Fix:
+
+- use a separate SQLite file per smoke run
+- or stop concurrent local runs
+- or use PostgreSQL for repeated concurrent runs
+
+## 14. Recommended Operating Practices
+
+For operators:
+
+- use PostgreSQL by default
+- keep `log_agent_activity = true`
+- inspect `summary.md` before trusting `Status: succeeded`
+- check validation results before accepting a patch
+
+For contributors:
+
+- use SQLite for quick local smoke runs when convenient
+- use `skill-status` and `skill-history` when tuning agent behavior
+- freeze skill promotion if you are debugging a specific regression
+- treat repo skill packs as versioned baselines, not ephemeral runtime state
+
+For repository maintenance:
+
+- keep dependency files accurate so the isolated runtime can bootstrap itself
+- prefer safe autofix defaults until validation is consistently strong
+- treat agent summaries as evidence, but rely on report artifacts and validation
+  results for final judgment
