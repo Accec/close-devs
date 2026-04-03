@@ -1,0 +1,7 @@
+[architecture]
+
+[[architecture.forbidden_imports]]
+source_glob = "src/agents/*.py"
+forbidden_prefix = "workflows"
+message = "Agents must not import workflow modules directly."
+

@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "Close-Devs"
+version = "0.1.0"
+description = "A three-agent Python system for long-term repository maintenance."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Accec" }]
+dependencies = [
+  "aiosqlite>=0.20.0",
+  "asyncpg>=0.30.0",
+  "aerich>=0.8.2",
+  "langchain-core>=0.3.0",
+  "langchain-openai>=0.2.0",
+  "langgraph>=0.2.0",
+  "tortoise-orm>=0.24.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+  "pytest-asyncio>=0.24.0",
+]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+markers = [
+  "postgres: integration tests requiring dockerized PostgreSQL",
+]
+
+[tool.aerich]
+tortoise_orm = "memory.database.TORTOISE_ORM"
+location = "./migrations"
+src_folder = "./src"

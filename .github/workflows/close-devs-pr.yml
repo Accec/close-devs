@@ -1,0 +1,90 @@
+name: Close-Devs PR Maintenance
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created]
+
+permissions:
+  actions: read
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  pr-maintenance:
+    if: >
+      github.event_name != 'issue_comment' ||
+      (github.event.issue.pull_request != null &&
+      contains(github.event.comment.body, '/close-devs rerun'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Close-Devs
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+
+      - name: Start PostgreSQL
+        run: docker compose up -d postgres
+
+      - name: Run database migrations
+        env:
+          DATABASE_URL: postgres://close_devs:close_devs@127.0.0.1:5432/close_devs
+        run: aerich upgrade
+
+      - name: Run PR maintenance analysis
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DATABASE_URL: postgres://close_devs:close_devs@127.0.0.1:5432/close_devs
+        run: |
+          python main.py pr-review \
+            --config config/default.toml \
+            --event-path "$GITHUB_EVENT_PATH" \
+            --repo "$GITHUB_WORKSPACE"
+
+      - name: Resolve Close-Devs report paths
+        id: report_paths
+        env:
+          DATABASE_URL: postgres://close_devs:close_devs@127.0.0.1:5432/close_devs
+        run: |
+          REPORT_DIR=$(python main.py report --config config/default.toml --repo "$GITHUB_WORKSPACE")
+          RUN_ID=$(basename "$REPORT_DIR")
+          echo "report_dir=$REPORT_DIR" >> "$GITHUB_OUTPUT"
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=close-devs-report-$RUN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Close-Devs artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.report_paths.outputs.artifact_name }}
+          path: ${{ steps.report_paths.outputs.report_dir }}
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Publish Close-Devs PR results
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DATABASE_URL: postgres://close_devs:close_devs@127.0.0.1:5432/close_devs
+        run: |
+          python main.py pr-publish \
+            --config config/default.toml \
+            --event-path "$GITHUB_EVENT_PATH" \
+            --publish-context "${{ steps.report_paths.outputs.report_dir }}/artifacts/publish_context.json" \
+            --repo "$GITHUB_WORKSPACE"
+
+      - name: Stop PostgreSQL
+        if: always()
+        run: docker compose down -v

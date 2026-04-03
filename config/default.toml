@@ -1,0 +1,60 @@
+[app]
+repo_root = "."
+state_dir = "state"
+reports_dir = "reports"
+scan_interval_minutes = 60
+log_level = "INFO"
+auto_apply_patch = false
+rules_path = "config/rules.toml"
+include = ["*.py", "**/*.py", "pyproject.toml", "README.md"]
+exclude = [
+  ".git/**",
+  ".venv/**",
+  "reports/**",
+  "state/**",
+  "__pycache__/**",
+  ".pytest_cache/**",
+  ".mypy_cache/**",
+]
+
+[llm]
+provider = "mock"
+model = "close-devs-mock"
+base_url = ""
+api_key_env = "OPENAI_API_KEY"
+timeout_seconds = 30
+temperature = 0.0
+system_prompt = "You are the Close-Devs maintenance planning model. Produce concise repo maintenance rationale and suggestions."
+
+[static_review]
+max_complexity = 10
+ruff_command = "ruff check"
+mypy_command = "mypy"
+bandit_command = "bandit -q -r"
+
+[dynamic_debug]
+smoke_commands = []
+test_commands = ["python3 -m pytest -q"]
+timeout_seconds = 120
+
+[github]
+provider = "github_actions"
+repo_full_name = ""
+base_branch = "main"
+token_env = "GITHUB_TOKEN"
+bot_branch_prefix = "close-devs/fix"
+companion_pr_label = "close-devs"
+review_mode = "review"
+artifact_retention_days = 7
+
+[pr_workflow]
+inline_comment_limit = 5
+allow_companion_pr = true
+safe_fix_only = true
+issue_comment_trigger = "/close-devs rerun"
+
+[database]
+backend = "postgres"
+url = "postgres://close_devs:close_devs@127.0.0.1:5432/close_devs"
+url_env = "DATABASE_URL"
+echo = false

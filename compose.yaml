@@ -1,0 +1,19 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: close_devs
+      POSTGRES_USER: close_devs
+      POSTGRES_PASSWORD: close_devs
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U close_devs -d close_devs"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - close_devs_pgdata:/var/lib/postgresql/data
+
+volumes:
+  close_devs_pgdata:
