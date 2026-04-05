@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import timedelta
 import hashlib
 import json
 from uuid import uuid4
@@ -16,6 +17,7 @@ from core.models import (
     SkillCandidate,
     SkillCandidateStatus,
     SkillEvaluation,
+    SkillEvaluationMode,
     SkillPack,
     SkillSource,
     WorkflowReport,
@@ -60,6 +62,15 @@ class SkillEvolutionService:
         if not auto_upgrade:
             return reflection, None
 
+        latest_candidate = await self.state_store.get_latest_skill_candidate(repo_root, result.agent_kind)
+        if (
+            latest_candidate is not None
+            and latest_candidate.status == SkillCandidateStatus.REJECTED
+            and latest_candidate.cooldown_until is not None
+            and latest_candidate.cooldown_until > reflection.created_at
+        ):
+            return reflection, None
+
         existing_candidate = await self.state_store.get_open_skill_candidate(repo_root, result.agent_kind)
         if existing_candidate is not None:
             return reflection, existing_candidate
@@ -89,6 +100,7 @@ class SkillEvolutionService:
         report: WorkflowReport,
         active_skills: dict[str, SkillPack],
         candidate_skills: dict[str, SkillCandidate],
+        shadow_replays: dict[str, dict[str, object]] | None = None,
     ) -> dict[str, object]:
         if not self.config.skills.enabled:
             return {
@@ -129,13 +141,25 @@ class SkillEvolutionService:
             if candidate is not None and self.config.skills.shadow_evaluation_enabled:
                 binding = await self.state_store.get_skill_binding(repo_root, agent_kind)
                 frozen = bool(binding.frozen) if binding is not None else False
-                candidate_score, reasons = self._shadow_candidate_score(
-                    agent_kind,
-                    report,
-                    result,
-                    candidate,
-                    active_score,
-                )
+                replay_payload = dict((shadow_replays or {}).get(agent_kind.value, {}))
+                replay_score = replay_payload.get("score")
+                if replay_score is not None:
+                    candidate_score = float(replay_score)
+                    reasons = [str(item) for item in replay_payload.get("reasons", [])]
+                    mode = SkillEvaluationMode.REPLAY
+                else:
+                    candidate_score, heuristic_reasons = self._shadow_candidate_score(
+                        agent_kind,
+                        report,
+                        result,
+                        candidate,
+                        active_score,
+                    )
+                    reasons = [
+                        *[str(item) for item in replay_payload.get("reasons", [])],
+                        *heuristic_reasons,
+                    ]
+                    mode = SkillEvaluationMode.HEURISTIC
                 promoted = False
                 next_shadow_runs = candidate.shadow_runs + 1
                 await self.state_store.save_skill_evaluation(
@@ -148,6 +172,7 @@ class SkillEvolutionService:
                         candidate_version=candidate.version,
                         active_score=active_score,
                         candidate_score=candidate_score,
+                        mode=mode,
                         promoted=False,
                         reasons=reasons,
                     )
@@ -182,6 +207,7 @@ class SkillEvolutionService:
                             candidate.candidate_id,
                             status=SkillCandidateStatus.REJECTED,
                             shadow_runs=next_shadow_runs,
+                            cooldown_until=report.finished_at + timedelta(hours=6),
                             notes=[*candidate.notes, "Rejected after shadow evaluation."],
                         )
                         upgrade_events.append(
@@ -203,6 +229,7 @@ class SkillEvolutionService:
                 evaluation_payload = {
                     "active_score": active_score,
                     "candidate_score": candidate_score,
+                    "mode": mode.value,
                     "promoted": promoted,
                     "reasons": reasons,
                     "shadow_runs": next_shadow_runs,
@@ -226,6 +253,14 @@ class SkillEvolutionService:
         if report.maintenance_result is not None:
             results[AgentKind.MAINTENANCE] = report.maintenance_result
         return results
+
+    def score_result(
+        self,
+        agent_kind: AgentKind,
+        report: WorkflowReport,
+        result: AgentResult,
+    ) -> float:
+        return self._score(agent_kind, report, result)
 
     def _result_metrics(self, result: AgentResult) -> dict[str, object]:
         session_summary = dict(result.artifacts.get("session_summary", {}))

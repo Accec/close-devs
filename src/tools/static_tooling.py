@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import ast
 from fnmatch import fnmatch
+import json
 from pathlib import Path
 import re
 import shlex
@@ -10,8 +11,9 @@ import shutil
 from typing import Any
 
 from core.config import AppConfig
-from core.models import AgentKind, Finding, Severity
+from core.models import AgentKind, Finding, LanguageProfile, Severity, StaticToolAdapter
 from tools.command_runner import CommandResult, CommandRunner
+from tools.language_support import build_static_tool_adapters
 
 
 RUFF_PATTERN = re.compile(
@@ -34,6 +36,8 @@ class StaticTooling:
         config: AppConfig,
         rules: dict[str, Any],
         env: dict[str, str] | None = None,
+        language_profile: LanguageProfile | None = None,
+        tool_adapters: list[StaticToolAdapter] | None = None,
     ) -> tuple[list[Finding], dict[str, Any]]:
         findings = await asyncio.to_thread(
             self._internal_findings,
@@ -43,28 +47,31 @@ class StaticTooling:
             rules,
         )
         artifacts: dict[str, Any] = {"external_tools": {}}
-
-        external_commands = {
-            "ruff": config.static_review.ruff_command,
-            "mypy": config.static_review.mypy_command,
-            "bandit": config.static_review.bandit_command,
-        }
+        adapters = list(tool_adapters or self._default_tool_adapters(repo_root, config, language_profile))
         tool_coroutines: list[asyncio.Future[tuple[str, CommandResult]] | asyncio.Task[tuple[str, CommandResult]]] = []
-        for tool_name, command in external_commands.items():
-            if not command:
+        for adapter in adapters:
+            if not adapter.command:
                 continue
-            executable = shlex.split(command)[0]
+            executable = shlex.split(adapter.command)[0]
             search_path = env.get("PATH") if env else None
             if shutil.which(executable, path=search_path) is None:
-                artifacts["external_tools"][tool_name] = {"status": "missing"}
+                artifacts["external_tools"][adapter.name] = {
+                    "status": "missing",
+                    "language": adapter.language,
+                    "ecosystem": adapter.ecosystem,
+                    "parser": adapter.parser,
+                }
                 continue
-            command_targets = targets or ["."]
-            quoted_targets = [shlex.quote(target) for target in command_targets]
-            full_command = " ".join([command, *quoted_targets])
+            if adapter.pass_targets:
+                command_targets = targets or ["."]
+                quoted_targets = [shlex.quote(target) for target in command_targets]
+                full_command = " ".join([adapter.command, *quoted_targets])
+            else:
+                full_command = adapter.command
             tool_coroutines.append(
                 asyncio.create_task(
                     self._run_external_tool(
-                        tool_name=tool_name,
+                        tool_name=adapter.name,
                         command=full_command,
                         repo_root=repo_root,
                         timeout_seconds=config.dynamic_debug.timeout_seconds,
@@ -81,6 +88,46 @@ class StaticTooling:
             findings.extend(self._parse_external_output(tool_name, result))
 
         return findings, artifacts
+
+    def _default_tool_adapters(
+        self,
+        repo_root: Path,
+        config: AppConfig,
+        language_profile: LanguageProfile | None,
+    ) -> list[StaticToolAdapter]:
+        if language_profile is not None:
+            return build_static_tool_adapters(
+                repo_root,
+                language_profile=language_profile,
+                python_commands={
+                    "ruff": config.static_review.ruff_command,
+                    "mypy": config.static_review.mypy_command,
+                    "bandit": config.static_review.bandit_command,
+                },
+            )
+        return [
+            StaticToolAdapter(
+                name="ruff",
+                language="python",
+                ecosystem="python",
+                command=str(config.static_review.ruff_command or ""),
+                parser="ruff",
+            ),
+            StaticToolAdapter(
+                name="mypy",
+                language="python",
+                ecosystem="python",
+                command=str(config.static_review.mypy_command or ""),
+                parser="mypy",
+            ),
+            StaticToolAdapter(
+                name="bandit",
+                language="python",
+                ecosystem="python",
+                command=str(config.static_review.bandit_command or ""),
+                parser="bandit",
+            ),
+        ]
 
     async def _run_external_tool(
         self,
@@ -477,6 +524,10 @@ class StaticTooling:
         return complexity
 
     def _parse_external_output(self, tool_name: str, result: CommandResult) -> list[Finding]:
+        if tool_name == "bandit":
+            return self._parse_bandit_output(result)
+        if tool_name == "eslint":
+            return self._parse_eslint_output(result)
         if result.returncode == 0 and not result.stdout.strip() and not result.stderr.strip():
             return []
 
@@ -493,19 +544,167 @@ class StaticTooling:
 
         if findings:
             return findings
+        if result.returncode != 0:
+            return [
+                Finding(
+                    source_agent=AgentKind.STATIC_REVIEW,
+                    severity=Severity.LOW,
+                    rule_id=f"{tool_name}-execution-failed",
+                    message=f"{tool_name} exited with code {result.returncode} and returned non-structured output.",
+                    category="tooling",
+                    evidence={
+                        "tool": tool_name,
+                        "stdout": result.stdout[:2000],
+                        "stderr": result.stderr[:2000],
+                    },
+                )
+            ]
+        return []
 
-        return [
-            Finding(
-                source_agent=AgentKind.STATIC_REVIEW,
-                severity=Severity.MEDIUM if result.returncode else Severity.LOW,
-                rule_id=f"{tool_name}-output",
-                message=line,
-                category="tooling",
-                evidence={"tool": tool_name},
+    def _parse_bandit_output(self, result: CommandResult) -> list[Finding]:
+        text = result.stdout.strip() or result.stderr.strip()
+        if not text:
+            return []
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            message = "Bandit returned unparsable JSON output."
+            if result.returncode != 0:
+                message = f"{message} Exit code {result.returncode}."
+            return [
+                Finding(
+                    source_agent=AgentKind.STATIC_REVIEW,
+                    severity=Severity.MEDIUM,
+                    rule_id="bandit-parse-error",
+                    message=message,
+                    category="tooling",
+                    evidence={
+                        "tool": "bandit",
+                        "stdout": result.stdout[:2000],
+                        "stderr": result.stderr[:2000],
+                    },
+                )
+            ]
+
+        results = payload.get("results", []) if isinstance(payload, dict) else []
+        findings: list[Finding] = []
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            severity = self._bandit_severity(item.get("issue_severity"))
+            path = str(item.get("filename", "")).strip() or None
+            if path and path.startswith("./"):
+                path = path[2:]
+            cwe = item.get("issue_cwe")
+            evidence = {
+                "tool": "bandit",
+                "confidence": item.get("issue_confidence"),
+                "test_name": item.get("test_name"),
+                "more_info": item.get("more_info"),
+                "code": str(item.get("code", "")).strip(),
+            }
+            if isinstance(cwe, dict):
+                evidence["cwe"] = {
+                    "id": cwe.get("id"),
+                    "link": cwe.get("link"),
+                }
+            elif cwe is not None:
+                evidence["cwe"] = cwe
+            findings.append(
+                Finding(
+                    source_agent=AgentKind.STATIC_REVIEW,
+                    severity=severity,
+                    rule_id=str(item.get("test_id", "bandit-issue")),
+                    message=str(item.get("issue_text", "Security issue reported by bandit.")),
+                    category="security",
+                    root_cause_class="application",
+                    path=path,
+                    line=int(item["line_number"]) if item.get("line_number") is not None else None,
+                    evidence=evidence,
+                )
             )
-            for line in text.splitlines()
-            if line.strip()
-        ]
+
+        if findings:
+            return findings
+
+        if result.returncode != 0:
+            return [
+                Finding(
+                    source_agent=AgentKind.STATIC_REVIEW,
+                    severity=Severity.MEDIUM,
+                    rule_id="bandit-execution-failed",
+                    message=f"Bandit exited with code {result.returncode} and did not return any issue records.",
+                    category="tooling",
+                    evidence={
+                        "tool": "bandit",
+                        "stdout": result.stdout[:2000],
+                        "stderr": result.stderr[:2000],
+                    },
+                )
+            ]
+        return []
+
+    def _bandit_severity(self, value: object) -> Severity:
+        normalized = str(value or "").strip().lower()
+        if normalized == "high":
+            return Severity.HIGH
+        if normalized == "medium":
+            return Severity.MEDIUM
+        return Severity.LOW
+
+    def _parse_eslint_output(self, result: CommandResult) -> list[Finding]:
+        text = result.stdout.strip() or result.stderr.strip()
+        if not text:
+            return []
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            return [
+                Finding(
+                    source_agent=AgentKind.STATIC_REVIEW,
+                    severity=Severity.LOW,
+                    rule_id="eslint-parse-error",
+                    message="ESLint returned unparsable JSON output.",
+                    category="tooling",
+                    evidence={"tool": "eslint"},
+                )
+            ]
+        if not isinstance(payload, list):
+            return []
+        findings: list[Finding] = []
+        for file_result in payload:
+            if not isinstance(file_result, dict):
+                continue
+            path = str(file_result.get("filePath", "")).strip()
+            if path.startswith("./"):
+                path = path[2:]
+            messages = file_result.get("messages", [])
+            if not isinstance(messages, list):
+                continue
+            for message in messages:
+                if not isinstance(message, dict):
+                    continue
+                severity = Severity.MEDIUM if int(message.get("severity", 1) or 1) >= 2 else Severity.LOW
+                findings.append(
+                    Finding(
+                        source_agent=AgentKind.STATIC_REVIEW,
+                        severity=severity,
+                        rule_id=str(message.get("ruleId") or "eslint-issue"),
+                        message=str(message.get("message") or "ESLint issue."),
+                        category="lint",
+                        path=path or None,
+                        line=int(message["line"]) if message.get("line") is not None else None,
+                        evidence={
+                            "tool": "eslint",
+                            "column": message.get("column"),
+                            "endLine": message.get("endLine"),
+                            "endColumn": message.get("endColumn"),
+                            "language": "typescript" if path.endswith((".ts", ".tsx")) else "javascript",
+                            "ecosystem": "node",
+                        },
+                    )
+                )
+        return findings
 
     def _parse_line(self, tool_name: str, line: str) -> Finding | None:
         if match := RUFF_PATTERN.match(line):
@@ -528,6 +727,32 @@ class StaticTooling:
                 category="typing",
                 path=match.group("path"),
                 line=int(match.group("line")),
+                evidence={"tool": tool_name},
+            )
+        if tool_name == "tsc" and (match := GENERIC_PATH_PATTERN.match(line)):
+            return Finding(
+                source_agent=AgentKind.STATIC_REVIEW,
+                severity=Severity.HIGH,
+                rule_id="tsc-error",
+                message=match.group("msg").strip(),
+                category="typing",
+                path=match.group("path"),
+                line=int(match.group("line")),
+                root_cause_class="application",
+                evidence={"tool": tool_name, "language": "typescript", "ecosystem": "node"},
+            )
+        if tool_name in {"go-test", "go-vet", "cargo-check", "cargo-clippy", "maven-compile", "gradle-check"} and (
+            match := GENERIC_PATH_PATTERN.match(line)
+        ):
+            return Finding(
+                source_agent=AgentKind.STATIC_REVIEW,
+                severity=Severity.MEDIUM,
+                rule_id=f"{tool_name}-issue",
+                message=match.group("msg").strip(),
+                category="correctness",
+                path=match.group("path"),
+                line=int(match.group("line")),
+                root_cause_class="application",
                 evidence={"tool": tool_name},
             )
         if match := GENERIC_PATH_PATTERN.match(line):

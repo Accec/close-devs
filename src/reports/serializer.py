@@ -82,6 +82,7 @@ def _finding_from_dict(data: dict[str, Any]) -> Finding:
         rule_id=str(data["rule_id"]),
         message=str(data["message"]),
         category=str(data["category"]),
+        root_cause_class=str(data["root_cause_class"]) if data.get("root_cause_class") else None,
         path=str(data["path"]) if data.get("path") else None,
         line=int(data["line"]) if data.get("line") is not None else None,
         symbol=str(data["symbol"]) if data.get("symbol") else None,
@@ -107,6 +108,7 @@ def _patch_from_dict(data: dict[str, Any]) -> PatchProposal:
         file_patches=[_file_patch_from_dict(item) for item in data.get("file_patches", [])],
         validation_targets=[str(item) for item in data.get("validation_targets", [])],
         suggestions=[str(item) for item in data.get("suggestions", [])],
+        metadata=dict(data.get("metadata", {})),
         applied=bool(data.get("applied", False)),
         diff_text=str(data.get("diff_text", "")),
     )

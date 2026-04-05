@@ -135,6 +135,11 @@ class BaseAgent(ABC):
             rule_id=str(data.get("rule_id", "agent-observation")),
             message=str(data.get("message", "")),
             category=str(data.get("category", "analysis")),
+            root_cause_class=(
+                str(data["root_cause_class"])
+                if data.get("root_cause_class") not in (None, "")
+                else None
+            ),
             path=str(data["path"]) if data.get("path") else None,
             line=self._coerce_line(data.get("line")),
             symbol=str(data["symbol"]) if data.get("symbol") else None,
@@ -170,6 +175,8 @@ class BaseAgent(ABC):
             description=str(data.get("description", "")),
             recommended_change=str(data.get("recommended_change", "")),
             severity=severity,
+            kind=str(data.get("kind", "code") or "code"),
+            confidence=self._coerce_confidence(data.get("confidence")),
             affected_files=[str(item) for item in data.get("affected_files", [])],
             evidence=evidence,
             metadata=self._coerce_mapping(data.get("metadata")),
@@ -182,6 +189,8 @@ class BaseAgent(ABC):
             "description": request.description,
             "recommended_change": request.recommended_change,
             "severity": request.severity.value,
+            "kind": request.kind,
+            "confidence": request.confidence,
             "affected_files": request.affected_files,
             "evidence": [
                 {
@@ -224,3 +233,13 @@ class BaseAgent(ABC):
         if isinstance(value, str) and value.isdigit():
             return int(value)
         return None
+
+    def _coerce_confidence(self, value: Any) -> float:
+        if isinstance(value, (int, float)):
+            return max(0.0, min(1.0, float(value)))
+        if isinstance(value, str):
+            try:
+                return max(0.0, min(1.0, float(value)))
+            except ValueError:
+                return 0.5
+        return 0.5

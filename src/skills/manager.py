@@ -88,6 +88,7 @@ class SkillManager:
                     "candidate_version": candidate.version if candidate is not None else None,
                     "candidate_shadow_runs": candidate.shadow_runs if candidate is not None else 0,
                     "candidate_status": candidate.status.value if candidate is not None else None,
+                    "candidate_cooldown_until": candidate.cooldown_until.isoformat() if candidate and candidate.cooldown_until else None,
                 }
             )
         return status_rows
@@ -124,6 +125,7 @@ class SkillManager:
                 "candidate_version": item.candidate_version,
                 "active_score": item.active_score,
                 "candidate_score": item.candidate_score,
+                "mode": item.mode.value,
                 "promoted": item.promoted,
                 "reasons": item.reasons,
                 "created_at": item.created_at.isoformat(),

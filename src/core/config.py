@@ -8,6 +8,7 @@ import tomllib
 
 
 DEFAULT_POSTGRES_URL = "postgres://close_devs:close_devs@127.0.0.1:5432/close_devs"
+APP_ROOT = Path(__file__).resolve().parents[2]
 
 
 @dataclass(slots=True)
@@ -18,6 +19,7 @@ class LLMConfig:
     api_key_env: str = "OPENAI_API_KEY"
     timeout_seconds: int = 30
     temperature: float = 0.0
+    max_retries: int = 2
     system_prompt: str = (
         "You are the Close-Devs maintenance planning model. "
         "Produce concise repo maintenance rationale and suggestions."
@@ -29,7 +31,22 @@ class StaticReviewConfig:
     max_complexity: int = 10
     ruff_command: str | None = "ruff check"
     mypy_command: str | None = "mypy"
-    bandit_command: str | None = "bandit -q -r"
+    bandit_command: str | None = "bandit -q -r -f json"
+    dependency_audit_command: str | None = "pip-audit --format json"
+    language_adapters_enabled: list[str] = field(
+        default_factory=lambda: [
+            "python",
+            "javascript",
+            "typescript",
+            "go",
+            "rust",
+            "java",
+            "kotlin",
+        ]
+    )
+    tool_policy: str = "augment_only"
+    dependency_audit_mode: str = "auto"
+    unsupported_language_mode: str = "generic_review"
 
 
 @dataclass(slots=True)
@@ -49,6 +66,7 @@ class GitHubRuntimeConfig:
     companion_pr_label: str = "close-devs"
     review_mode: str = "review"
     artifact_retention_days: int = 7
+    publish_retry_count: int = 2
 
 
 @dataclass(slots=True)
@@ -65,6 +83,7 @@ class DatabaseConfig:
     url: str = DEFAULT_POSTGRES_URL
     url_env: str = "DATABASE_URL"
     echo: bool = False
+    sqlite_busy_timeout_ms: int = 5000
 
 
 @dataclass(slots=True)
@@ -75,11 +94,39 @@ class EnvironmentConfig:
     install_fail_policy: str = "mark_degraded"
     python_executable: str = "python3"
     bootstrap_tools: bool = True
+    dependency_sources_priority: list[str] = field(
+        default_factory=lambda: [
+            "src/requirements.txt",
+            "requirements.txt",
+            "requirements/base.txt",
+            "src/requirements-dev.txt",
+            "requirements-dev.txt",
+            "requirements/dev.txt",
+            "src/requirements-test.txt",
+            "requirements-test.txt",
+            "requirements/test.txt",
+            "pyproject.toml:project.dependencies",
+            "pyproject.toml:project.optional-dependencies.dev",
+            "pyproject.toml:project.optional-dependencies.test",
+            "pyproject.toml:poetry.dependencies",
+            "poetry.lock",
+            "pyproject.toml:pdm.dependencies",
+            "pdm.lock",
+            "pyproject.toml:uv.dependencies",
+            "uv.lock",
+        ]
+    )
 
 
 @dataclass(slots=True)
 class AgentRuntimeConfig:
+    provider: str | None = None
     model: str | None = None
+    base_url: str | None = None
+    api_key_env: str | None = None
+    temperature: float | None = None
+    timeout_seconds: int | None = None
+    system_prompt: str | None = None
     max_steps: int = 16
     max_tool_calls: int = 24
     max_wall_time_seconds: int = 600
@@ -145,8 +192,24 @@ class AppConfig:
     state_dir: Path
     reports_dir: Path
     rules_path: Path
-    include: list[str] = field(default_factory=lambda: ["*.py", "**/*.py"])
-    exclude: list[str] = field(default_factory=list)
+    include: list[str] = field(default_factory=lambda: ["*", "**/*"])
+    exclude: list[str] = field(
+        default_factory=lambda: [
+            ".git/**",
+            ".venv/**",
+            "reports/**",
+            "state/**",
+            "__pycache__/**",
+            ".pytest_cache/**",
+            ".mypy_cache/**",
+            "node_modules/**",
+            "dist/**",
+            "build/**",
+            "target/**",
+            ".gradle/**",
+            "coverage/**",
+        ]
+    )
     scan_interval_minutes: int = 60
     log_level: str = "INFO"
     log_agent_activity: bool = True
@@ -167,6 +230,57 @@ def _resolve_path(base_dir: Path, value: str | None, fallback: str) -> Path:
     if raw.is_absolute():
         return raw
     return (base_dir / raw).resolve()
+
+
+def _resolve_support_path(base_dir: Path, value: str | None, fallback: str) -> Path:
+    raw = Path(value or fallback)
+    if raw.is_absolute():
+        return raw
+    base_candidate = (base_dir / raw).resolve()
+    if base_candidate.exists():
+        return base_candidate
+    app_candidate = (APP_ROOT / raw).resolve()
+    if app_candidate.exists():
+        return app_candidate
+    return base_candidate
+
+
+def _optional_str(value: object) -> str | None:
+    if value in (None, ""):
+        return None
+    return str(value)
+
+
+def _optional_float(value: object) -> float | None:
+    if value in (None, ""):
+        return None
+    return float(value)
+
+
+def _optional_int(value: object) -> int | None:
+    if value in (None, ""):
+        return None
+    return int(value)
+
+
+def default_api_key_env_for_provider(provider: str) -> str:
+    mapping = {
+        "openai": "OPENAI_API_KEY",
+        "openai_compatible": "OPENAI_API_KEY",
+        "anthropic": "ANTHROPIC_API_KEY",
+        "google_genai": "GOOGLE_API_KEY",
+        "ollama": "",
+        "mock": "",
+    }
+    return mapping.get(provider, "OPENAI_API_KEY")
+
+
+def default_base_url_for_provider(provider: str) -> str | None:
+    if provider == "ollama":
+        return "http://127.0.0.1:11434"
+    if provider == "openai_compatible":
+        return "https://api.openai.com/v1"
+    return None
 
 
 def _default_database_url(backend: str, state_dir: Path) -> str:
@@ -230,7 +344,7 @@ def load_config(path: Path, repo_override: Path | None = None) -> AppConfig:
     )
     state_dir = _resolve_path(base_dir, app_section.get("state_dir"), "state")
     reports_dir = _resolve_path(base_dir, app_section.get("reports_dir"), "reports")
-    rules_path = _resolve_path(base_dir, app_section.get("rules_path"), "config/rules.toml")
+    rules_path = _resolve_support_path(base_dir, app_section.get("rules_path"), "config/rules.toml")
     database_backend = str(database_section.get("backend", "postgres"))
     database_url_env = str(database_section.get("url_env", "DATABASE_URL"))
     database_url = _resolve_database_url(
@@ -240,30 +354,49 @@ def load_config(path: Path, repo_override: Path | None = None) -> AppConfig:
         state_dir=state_dir,
     )
     database_backend = _infer_database_backend(database_url, database_backend)
-    skills_repo_root = _resolve_path(base_dir, skills_section.get("repo_root"), "config/skills")
+    skills_repo_root = _resolve_support_path(base_dir, skills_section.get("repo_root"), "config/skills")
+    llm_provider = str(llm_section.get("provider", "mock"))
+
+    static_defaults = StaticReviewConfig()
 
     return AppConfig(
         repo_root=repo_root,
         state_dir=state_dir,
         reports_dir=reports_dir,
         rules_path=rules_path,
-        include=list(app_section.get("include", ["*.py", "**/*.py"])),
-        exclude=list(app_section.get("exclude", [])),
+        include=list(app_section.get("include", ["*", "**/*"])),
+        exclude=list(
+            app_section.get(
+                "exclude",
+                [
+                    ".git/**",
+                    ".venv/**",
+                    "reports/**",
+                    "state/**",
+                    "__pycache__/**",
+                    ".pytest_cache/**",
+                    ".mypy_cache/**",
+                    "node_modules/**",
+                    "dist/**",
+                    "build/**",
+                    "target/**",
+                    ".gradle/**",
+                    "coverage/**",
+                ],
+            )
+        ),
         scan_interval_minutes=int(app_section.get("scan_interval_minutes", 60)),
         log_level=str(app_section.get("log_level", "INFO")),
         log_agent_activity=bool(app_section.get("log_agent_activity", True)),
         auto_apply_patch=bool(app_section.get("auto_apply_patch", False)),
         llm=LLMConfig(
-            provider=str(llm_section.get("provider", "mock")),
+            provider=llm_provider,
             model=str(llm_section.get("model", "close-devs-mock")),
-            base_url=(
-                str(llm_section["base_url"])
-                if llm_section.get("base_url") not in (None, "")
-                else None
-            ),
-            api_key_env=str(llm_section.get("api_key_env", "OPENAI_API_KEY")),
+            base_url=_optional_str(llm_section.get("base_url")) or default_base_url_for_provider(llm_provider),
+            api_key_env=_optional_str(llm_section.get("api_key_env")) or default_api_key_env_for_provider(llm_provider),
             timeout_seconds=int(llm_section.get("timeout_seconds", 30)),
             temperature=float(llm_section.get("temperature", 0.0)),
+            max_retries=int(llm_section.get("max_retries", 2)),
             system_prompt=str(
                 llm_section.get(
                     "system_prompt",
@@ -276,9 +409,35 @@ def load_config(path: Path, repo_override: Path | None = None) -> AppConfig:
         ),
         static_review=StaticReviewConfig(
             max_complexity=int(static_section.get("max_complexity", 10)),
-            ruff_command=static_section.get("ruff_command"),
-            mypy_command=static_section.get("mypy_command"),
-            bandit_command=static_section.get("bandit_command"),
+            ruff_command=static_section.get("ruff_command", static_defaults.ruff_command),
+            mypy_command=static_section.get("mypy_command", static_defaults.mypy_command),
+            bandit_command=static_section.get("bandit_command", static_defaults.bandit_command),
+            dependency_audit_command=static_section.get(
+                "dependency_audit_command",
+                static_defaults.dependency_audit_command,
+            ),
+            language_adapters_enabled=[
+                str(item)
+                for item in static_section.get(
+                    "language_adapters_enabled",
+                    static_defaults.language_adapters_enabled,
+                )
+            ],
+            tool_policy=str(
+                static_section.get("tool_policy", static_defaults.tool_policy)
+            ),
+            dependency_audit_mode=str(
+                static_section.get(
+                    "dependency_audit_mode",
+                    static_defaults.dependency_audit_mode,
+                )
+            ),
+            unsupported_language_mode=str(
+                static_section.get(
+                    "unsupported_language_mode",
+                    static_defaults.unsupported_language_mode,
+                )
+            ),
         ),
         dynamic_debug=DynamicDebugConfig(
             smoke_commands=list(dynamic_section.get("smoke_commands", [])),
@@ -300,6 +459,7 @@ def load_config(path: Path, repo_override: Path | None = None) -> AppConfig:
             artifact_retention_days=int(
                 github_section.get("artifact_retention_days", 7)
             ),
+            publish_retry_count=int(github_section.get("publish_retry_count", 2)),
         ),
         pr_workflow=PRWorkflowConfig(
             inline_comment_limit=int(pr_section.get("inline_comment_limit", 5)),
@@ -314,6 +474,9 @@ def load_config(path: Path, repo_override: Path | None = None) -> AppConfig:
             url=str(database_url),
             url_env=database_url_env,
             echo=bool(database_section.get("echo", False)),
+            sqlite_busy_timeout_ms=int(
+                database_section.get("sqlite_busy_timeout_ms", 5000)
+            ),
         ),
         environment=EnvironmentConfig(
             enabled=bool(environment_section.get("enabled", True)),
@@ -326,12 +489,34 @@ def load_config(path: Path, repo_override: Path | None = None) -> AppConfig:
                 environment_section.get("python_executable", "python3")
             ),
             bootstrap_tools=bool(environment_section.get("bootstrap_tools", True)),
+            dependency_sources_priority=[
+                str(item)
+                for item in environment_section.get(
+                    "dependency_sources_priority",
+                    [
+                        "src/requirements.txt",
+                        "requirements.txt",
+                        "requirements-dev.txt",
+                        "requirements-test.txt",
+                        "pyproject.toml:project.dependencies",
+                        "poetry.lock",
+                        "pdm.lock",
+                        "uv.lock",
+                    ],
+                )
+            ],
         ),
         agents=AgentsConfig(
             static=AgentRuntimeConfig(
+                provider=_optional_str(agents_section.get("static", {}).get("provider")),
                 model=str(agents_section.get("static", {}).get("model"))
                 if agents_section.get("static", {}).get("model") not in (None, "")
                 else None,
+                base_url=_optional_str(agents_section.get("static", {}).get("base_url")),
+                api_key_env=_optional_str(agents_section.get("static", {}).get("api_key_env")),
+                temperature=_optional_float(agents_section.get("static", {}).get("temperature")),
+                timeout_seconds=_optional_int(agents_section.get("static", {}).get("timeout_seconds")),
+                system_prompt=_optional_str(agents_section.get("static", {}).get("system_prompt")),
                 max_steps=int(agents_section.get("static", {}).get("max_steps", 24)),
                 max_tool_calls=int(agents_section.get("static", {}).get("max_tool_calls", 32)),
                 max_wall_time_seconds=int(
@@ -358,9 +543,15 @@ def load_config(path: Path, repo_override: Path | None = None) -> AppConfig:
                 ),
             ),
             dynamic=AgentRuntimeConfig(
+                provider=_optional_str(agents_section.get("dynamic", {}).get("provider")),
                 model=str(agents_section.get("dynamic", {}).get("model"))
                 if agents_section.get("dynamic", {}).get("model") not in (None, "")
                 else None,
+                base_url=_optional_str(agents_section.get("dynamic", {}).get("base_url")),
+                api_key_env=_optional_str(agents_section.get("dynamic", {}).get("api_key_env")),
+                temperature=_optional_float(agents_section.get("dynamic", {}).get("temperature")),
+                timeout_seconds=_optional_int(agents_section.get("dynamic", {}).get("timeout_seconds")),
+                system_prompt=_optional_str(agents_section.get("dynamic", {}).get("system_prompt")),
                 max_steps=int(agents_section.get("dynamic", {}).get("max_steps", 32)),
                 max_tool_calls=int(agents_section.get("dynamic", {}).get("max_tool_calls", 40)),
                 max_wall_time_seconds=int(
@@ -387,9 +578,15 @@ def load_config(path: Path, repo_override: Path | None = None) -> AppConfig:
                 ),
             ),
             maintenance=AgentRuntimeConfig(
+                provider=_optional_str(agents_section.get("maintenance", {}).get("provider")),
                 model=str(agents_section.get("maintenance", {}).get("model"))
                 if agents_section.get("maintenance", {}).get("model") not in (None, "")
                 else None,
+                base_url=_optional_str(agents_section.get("maintenance", {}).get("base_url")),
+                api_key_env=_optional_str(agents_section.get("maintenance", {}).get("api_key_env")),
+                temperature=_optional_float(agents_section.get("maintenance", {}).get("temperature")),
+                timeout_seconds=_optional_int(agents_section.get("maintenance", {}).get("timeout_seconds")),
+                system_prompt=_optional_str(agents_section.get("maintenance", {}).get("system_prompt")),
                 max_steps=int(agents_section.get("maintenance", {}).get("max_steps", 40)),
                 max_tool_calls=int(agents_section.get("maintenance", {}).get("max_tool_calls", 48)),
                 max_wall_time_seconds=int(

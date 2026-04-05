@@ -173,19 +173,20 @@ class GitHubAdapter:
 
         marker = summary_comment_marker(pr_context)
         try:
-            existing = await self.find_existing_summary_comment(pr_context, marker)
-            if existing is None:
-                response = await self._request_json(
-                    "POST",
-                    f"/repos/{pr_context.repo_full_name}/issues/{pr_context.pr_number}/comments",
-                    data={"body": payload.body},
-                )
-            else:
-                response = await self._request_json(
+            async def publish() -> dict[str, Any]:
+                existing = await self.find_existing_summary_comment(pr_context, marker)
+                if existing is None:
+                    return await self._request_json(
+                        "POST",
+                        f"/repos/{pr_context.repo_full_name}/issues/{pr_context.pr_number}/comments",
+                        data={"body": payload.body},
+                    )
+                return await self._request_json(
                     "PATCH",
                     f"/repos/{pr_context.repo_full_name}/issues/comments/{existing['id']}",
                     data={"body": payload.body},
                 )
+            response = await self._with_retries("summary-comment", publish)
         except Exception as exc:
             self.logger.warning("Failed to create/update summary comment: %s", exc)
             return {"status": "failed", "error": str(exc)}
@@ -217,10 +218,13 @@ class GitHubAdapter:
 
         artifact_url: str | None = None
         try:
-            response = await self._request_json(
-                "GET",
-                f"/repos/{pr_context.repo_full_name}/actions/runs/{run_id}/artifacts",
-                query={"per_page": "100"},
+            response = await self._with_retries(
+                "resolve-run-artifacts",
+                lambda: self._request_json(
+                    "GET",
+                    f"/repos/{pr_context.repo_full_name}/actions/runs/{run_id}/artifacts",
+                    query={"per_page": "100"},
+                ),
             )
             artifacts = response.get("artifacts", []) if isinstance(response, dict) else []
             for artifact in artifacts:
@@ -279,16 +283,19 @@ class GitHubAdapter:
         errors: list[str] = []
         for item in inline_comments:
             try:
-                await self._request_json(
-                    "POST",
-                    f"/repos/{pr_context.repo_full_name}/pulls/{pr_context.pr_number}/comments",
-                    data={
-                        "body": item["body"],
-                        "commit_id": pr_context.head_sha,
-                        "path": item["path"],
-                        "line": item["line"],
-                        "side": "RIGHT",
-                    },
+                await self._with_retries(
+                    "inline-comment",
+                    lambda item=item: self._request_json(
+                        "POST",
+                        f"/repos/{pr_context.repo_full_name}/pulls/{pr_context.pr_number}/comments",
+                        data={
+                            "body": item["body"],
+                            "commit_id": pr_context.head_sha,
+                            "path": item["path"],
+                            "line": item["line"],
+                            "side": "RIGHT",
+                        },
+                    ),
                 )
                 published += 1
             except Exception as exc:
@@ -307,6 +314,32 @@ class GitHubAdapter:
         payload: ReviewPayload,
     ) -> dict[str, Any]:
         return await self.create_or_update_summary_comment(pr_context, payload)
+
+    async def _with_retries(
+        self,
+        label: str,
+        operation,
+    ) -> Any:
+        last_error: Exception | None = None
+        attempts = max(1, int(self.config.publish_retry_count))
+        for attempt in range(1, attempts + 1):
+            try:
+                return await operation()
+            except Exception as exc:  # pragma: no cover - exercised via call sites
+                last_error = exc
+                if attempt >= attempts:
+                    break
+                self.logger.warning(
+                    "GitHub adapter retrying %s after failure (%s/%s): %s",
+                    label,
+                    attempt,
+                    attempts,
+                    exc,
+                )
+                await asyncio.sleep(0.5 * attempt)
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError(f"GitHub adapter retry wrapper reached invalid state for {label}")
 
     async def publish_fix_branch(
         self,

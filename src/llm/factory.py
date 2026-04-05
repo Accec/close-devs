@@ -10,17 +10,26 @@ from llm.mock import MockLLMClient
 def build_llm_client(config: LLMConfig, logger: logging.Logger) -> BaseLLMClient:
     if config.provider == "mock":
         return MockLLMClient()
+    if config.provider == "openai":
+        from llm.openai_native import OpenAINativeLLMClient
+
+        return OpenAINativeLLMClient(config)
     if config.provider == "openai_compatible":
-        try:
-            from llm.openai_compatible import OpenAICompatibleLLMClient
+        from llm.openai_compatible import OpenAICompatibleLLMClient
 
-            return OpenAICompatibleLLMClient(config)
-        except Exception as exc:
-            logger.warning(
-                "Failed to initialize openai-compatible client (%s). Falling back to mock.",
-                exc,
-            )
-            return MockLLMClient()
+        return OpenAICompatibleLLMClient(config)
+    if config.provider == "anthropic":
+        from llm.anthropic_native import AnthropicNativeLLMClient
 
-    logger.warning("Unknown LLM provider '%s'. Falling back to mock.", config.provider)
-    return MockLLMClient()
+        return AnthropicNativeLLMClient(config)
+    if config.provider == "google_genai":
+        from llm.google_genai import GoogleGenAILLMClient
+
+        return GoogleGenAILLMClient(config)
+    if config.provider == "ollama":
+        from llm.ollama_local import OllamaLocalLLMClient
+
+        return OllamaLocalLLMClient(config)
+
+    logger.error("Unknown LLM provider '%s'.", config.provider)
+    raise ValueError(f"Unknown LLM provider: {config.provider}")

@@ -97,6 +97,9 @@ class MaintenanceAgent(BaseAgent):
                 "patch_kind": str(latest_patch_output.get("patch_kind", "advisory_only_patch")),
                 "applied_rule_ids": list(latest_patch_output.get("applied_rule_ids", [])),
                 "unsupported_findings": list(latest_patch_output.get("unsupported_findings", [])),
+                "unresolved_handoffs": list(latest_patch_output.get("unresolved_handoffs", [])),
+                "auto_fixed_blockers": list(latest_patch_output.get("auto_fixed_blockers", [])),
+                "repair_scope": list(latest_patch_output.get("repair_scope", [])),
             }
         )
         summary = str(
@@ -147,6 +150,14 @@ class MaintenanceAgent(BaseAgent):
             file_patches=file_patches,
             validation_targets=[str(item) for item in output.get("validation_targets", [])],
             suggestions=[str(item) for item in kernel_result.final_response.get("suggestions", output.get("suggestions", []))],
+            metadata={
+                "repair_scope": [str(item) for item in output.get("repair_scope", [])],
+                "patch_kind": str(output.get("patch_kind", "advisory_only_patch")),
+                "safe_fix_only": bool(output.get("safe_fix_only", False)),
+                "unsupported_findings": list(output.get("unsupported_findings", [])),
+                "unresolved_handoffs": list(output.get("unresolved_handoffs", [])),
+                "auto_fixed_blockers": list(output.get("auto_fixed_blockers", [])),
+            },
             applied=bool(output.get("applied", False)),
             diff_text=str(output.get("diff_text", "")),
         )
@@ -163,4 +174,6 @@ class MaintenanceAgent(BaseAgent):
             reasons.append("no_safe_patch_generated")
         if latest_patch_output.get("file_patches") and not latest_patch_output.get("safe_fix_only", False):
             reasons.append("patch_contains_non_safe_rules")
+        if latest_patch_output.get("unresolved_handoffs"):
+            reasons.append("unresolved_high_value_handoffs")
         return reasons

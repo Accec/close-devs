@@ -20,6 +20,7 @@ from core.models import (
     SkillCandidate,
     SkillCandidateStatus,
     SkillEvaluation,
+    SkillEvaluationMode,
     SkillPack,
     SkillPolicy,
     SkillSource,
@@ -172,6 +173,7 @@ class StateStore:
                 severity=finding.severity.value,
                 rule_id=finding.rule_id,
                 category=finding.category,
+                root_cause_class=finding.root_cause_class,
                 path=finding.path,
                 line=finding.line,
                 symbol=finding.symbol,
@@ -202,6 +204,7 @@ class StateStore:
                 "touched_files": patch.touched_files,
                 "diff_text": patch.diff_text,
                 "suggestions": patch.suggestions,
+                "metadata": patch.metadata,
                 "applied": patch.applied,
                 "file_patches": file_patches,
             },
@@ -332,6 +335,8 @@ class StateStore:
                 description=str(item.get("description", "")),
                 recommended_change=str(item.get("recommended_change", "")),
                 severity=str(item.get("severity", "low")),
+                kind=str(item.get("kind", "code")),
+                confidence=float(item.get("confidence", 0.5) or 0.5),
                 affected_files=[str(path) for path in item.get("affected_files", [])],
                 evidence=list(item.get("evidence", [])),
                 metadata=dict(item.get("metadata", {})),
@@ -419,6 +424,7 @@ class StateStore:
                 "status": candidate.status.value,
                 "shadow_runs": candidate.shadow_runs,
                 "notes": candidate.notes,
+                "cooldown_until": candidate.cooldown_until,
                 "skill_payload": self._serialize_skill_pack(candidate.skill_pack),
                 "created_at": candidate.created_at,
             },
@@ -440,6 +446,21 @@ class StateStore:
         )
         return self._deserialize_skill_candidate(record) if record is not None else None
 
+    async def get_latest_skill_candidate(
+        self,
+        repo_root: str,
+        agent_kind: AgentKind,
+    ) -> SkillCandidate | None:
+        record = (
+            await SkillCandidateRecord.filter(
+                repo_root=repo_root,
+                agent_kind=agent_kind.value,
+            )
+            .order_by("-created_at")
+            .first()
+        )
+        return self._deserialize_skill_candidate(record) if record is not None else None
+
     async def update_skill_candidate(
         self,
         candidate_id: str,
@@ -447,6 +468,7 @@ class StateStore:
         status: SkillCandidateStatus | None = None,
         shadow_runs: int | None = None,
         notes: list[str] | None = None,
+        cooldown_until: datetime | None = None,
     ) -> None:
         updates: dict[str, Any] = {}
         if status is not None:
@@ -455,6 +477,8 @@ class StateStore:
             updates["shadow_runs"] = shadow_runs
         if notes is not None:
             updates["notes"] = notes
+        if cooldown_until is not None:
+            updates["cooldown_until"] = cooldown_until
         if updates:
             await SkillCandidateRecord.filter(candidate_id=candidate_id).update(**updates)
 
@@ -469,6 +493,7 @@ class StateStore:
                 "candidate_version": evaluation.candidate_version,
                 "active_score": evaluation.active_score,
                 "candidate_score": evaluation.candidate_score,
+                "mode": evaluation.mode.value,
                 "promoted": evaluation.promoted,
                 "reasons": evaluation.reasons,
                 "created_at": evaluation.created_at,
@@ -641,6 +666,7 @@ class StateStore:
             created_at=record.created_at,
             shadow_runs=int(record.shadow_runs),
             notes=[str(item) for item in record.notes or []],
+            cooldown_until=record.cooldown_until,
         )
 
     def _deserialize_skill_evaluation(self, record: SkillEvaluationRecord) -> SkillEvaluation:
@@ -653,6 +679,7 @@ class StateStore:
             candidate_version=record.candidate_version,
             active_score=float(record.active_score),
             candidate_score=float(record.candidate_score) if record.candidate_score is not None else None,
+            mode=SkillEvaluationMode(str(record.mode or SkillEvaluationMode.HEURISTIC.value)),
             promoted=bool(record.promoted),
             reasons=[str(item) for item in record.reasons or []],
             created_at=record.created_at,

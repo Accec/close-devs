@@ -92,6 +92,10 @@ async def init_database(database: DatabaseConfig, *, ensure_schema: bool = False
     try:
         connection = connections.get("default")
         await connection.execute_query("SELECT 1")
+        if database.backend == "sqlite":
+            await connection.execute_query(
+                f"PRAGMA busy_timeout = {int(database.sqlite_busy_timeout_ms)}"
+            )
         if ensure_schema:
             await Tortoise.generate_schemas(safe=True)
         else:

@@ -7,7 +7,7 @@ log_level = "INFO"
 log_agent_activity = true
 auto_apply_patch = false
 rules_path = "config/rules.toml"
-include = ["*.py", "**/*.py", "pyproject.toml", "README.md"]
+include = ["*", "**/*"]
 exclude = [
   ".git/**",
   ".venv/**",
@@ -16,22 +16,34 @@ exclude = [
   "__pycache__/**",
   ".pytest_cache/**",
   ".mypy_cache/**",
+  "node_modules/**",
+  "dist/**",
+  "build/**",
+  "target/**",
+  ".gradle/**",
+  "coverage/**",
 ]
 
 [llm]
-provider = "openai_compatible"
+provider = "openai"
 model = "gpt-5.4"
-base_url = "https://api.openai.com/v1"
+base_url = ""
 api_key_env = "OPENAI_API_KEY"
 timeout_seconds = 30
 temperature = 0.0
+max_retries = 2
 system_prompt = "You are the Close-Devs maintenance planning model. Produce concise repo maintenance rationale and suggestions."
 
 [static_review]
 max_complexity = 10
 ruff_command = "ruff check"
 mypy_command = "mypy"
-bandit_command = "bandit -q -r"
+bandit_command = "bandit -q -r -f json"
+dependency_audit_command = "pip-audit --format json"
+language_adapters_enabled = ["python", "javascript", "typescript", "go", "rust", "java", "kotlin"]
+tool_policy = "augment_only"
+dependency_audit_mode = "auto"
+unsupported_language_mode = "generic_review"
 
 [dynamic_debug]
 smoke_commands = []
@@ -47,6 +59,7 @@ bot_branch_prefix = "close-devs/fix"
 companion_pr_label = "close-devs"
 review_mode = "review"
 artifact_retention_days = 7
+publish_retry_count = 2
 
 [pr_workflow]
 inline_comment_limit = 5
@@ -59,6 +72,7 @@ backend = "postgres"
 url = "postgres://close_devs:close_devs@127.0.0.1:5432/close_devs"
 url_env = "DATABASE_URL"
 echo = false
+sqlite_busy_timeout_ms = 5000
 
 [environment]
 enabled = true
@@ -67,6 +81,26 @@ install_mode = "auto_detect"
 install_fail_policy = "mark_degraded"
 python_executable = "python3"
 bootstrap_tools = true
+dependency_sources_priority = [
+  "src/requirements.txt",
+  "requirements.txt",
+  "requirements/base.txt",
+  "src/requirements-dev.txt",
+  "requirements-dev.txt",
+  "requirements/dev.txt",
+  "src/requirements-test.txt",
+  "requirements-test.txt",
+  "requirements/test.txt",
+  "pyproject.toml:project.dependencies",
+  "pyproject.toml:project.optional-dependencies.dev",
+  "pyproject.toml:project.optional-dependencies.test",
+  "pyproject.toml:poetry.dependencies",
+  "poetry.lock",
+  "pyproject.toml:pdm.dependencies",
+  "pdm.lock",
+  "pyproject.toml:uv.dependencies",
+  "uv.lock",
+]
 
 [skills]
 enabled = true
@@ -88,7 +122,11 @@ baseline = "baseline"
 auto_upgrade = true
 
 [agents.static]
+# provider = "google_genai"
 model = "gpt-5.4"
+# api_key_env = "GOOGLE_API_KEY"
+# temperature = 0.0
+# timeout_seconds = 30
 max_steps = 24
 max_tool_calls = 32
 max_wall_time_seconds = 900
@@ -113,7 +151,11 @@ allowed_tool_superset = [
 ]
 
 [agents.dynamic]
+# provider = "openai"
 model = "gpt-5.4"
+# api_key_env = "OPENAI_API_KEY"
+# temperature = 0.0
+# timeout_seconds = 30
 max_steps = 32
 max_tool_calls = 40
 max_wall_time_seconds = 1200
@@ -136,7 +178,11 @@ allowed_tool_superset = [
 ]
 
 [agents.maintenance]
+# provider = "anthropic"
 model = "gpt-5.4"
+# api_key_env = "ANTHROPIC_API_KEY"
+# temperature = 0.0
+# timeout_seconds = 30
 max_steps = 40
 max_tool_calls = 48
 max_wall_time_seconds = 1500

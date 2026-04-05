@@ -14,6 +14,8 @@ class TaskDispatcher:
         run_id: str,
         targets: list[str],
         commands: list[str],
+        *,
+        static_context: object | None = None,
     ) -> tuple[Task, Task]:
         static_task = Task(
             task_id=self._new_task_id(),
@@ -21,7 +23,7 @@ class TaskDispatcher:
             agent_kind=AgentKind.STATIC_REVIEW,
             task_type=TaskType.STATIC_REVIEW,
             targets=targets,
-            payload={},
+            payload={"static_context": static_context} if static_context is not None else {},
         )
         dynamic_task = Task(
             task_id=self._new_task_id(),
@@ -39,6 +41,7 @@ class TaskDispatcher:
         feedback: FeedbackBundle,
         *,
         handoffs: list[dict[str, object]] | None = None,
+        startup_topology: object | None = None,
     ) -> Task:
         return Task(
             task_id=self._new_task_id(),
@@ -46,7 +49,11 @@ class TaskDispatcher:
             agent_kind=AgentKind.MAINTENANCE,
             task_type=TaskType.MAINTENANCE,
             targets=feedback.change_set.all_touched_files,
-            payload={"feedback": feedback, "handoffs": list(handoffs or [])},
+            payload={
+                "feedback": feedback,
+                "handoffs": list(handoffs or []),
+                "startup_topology": startup_topology,
+            },
         )
 
     def create_validation_tasks(

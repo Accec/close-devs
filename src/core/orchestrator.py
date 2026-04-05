@@ -4,14 +4,25 @@ import argparse
 import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
+import shlex
+import shutil
 from typing import Iterable
+from uuid import uuid4
 
 from langgraph.graph import END, START, StateGraph
 
 from agents.dynamic_debug import DynamicDebugAgent
 from agents.maintenance import MaintenanceAgent
 from agents.static_review import StaticReviewAgent
-from core.config import AgentRuntimeConfig, AppConfig, LLMConfig, load_config, load_rules
+from core.config import (
+    AgentRuntimeConfig,
+    AppConfig,
+    LLMConfig,
+    default_api_key_env_for_provider,
+    default_base_url_for_provider,
+    load_config,
+    load_rules,
+)
 from core.dispatcher import TaskDispatcher
 from core.logging import configure_logging
 from core.models import (
@@ -21,6 +32,10 @@ from core.models import (
     ChangeSet,
     ExecutionEnvironment,
     FeedbackBundle,
+    FilePatch,
+    Finding,
+    StaticContextBundle,
+    PatchProposal,
     PublishContext,
     PublishMode,
     PullRequestContext,
@@ -43,13 +58,17 @@ from memory.state_store import StateStore
 from repo.change_detector import ChangeDetector
 from repo.scanner import RepositoryScanner
 from reports.markdown import write_markdown
-from reports.serializer import publish_context_from_dict, read_json, workflow_report_from_dict, write_json
+from reports.enrichment import enrich_report_snippets
+from reports.serializer import publish_context_from_dict, read_json, to_jsonable, workflow_report_from_dict, write_json
 from skills.evolution import SkillEvolutionService
 from skills.manager import SkillManager
 from tools.file_store import FileStore
 from tools.environment_manager import EnvironmentManager
 from tools.patch_service import PatchService
 from tools.agent_toolkit import AgentToolkitFactory
+from tools.dependency_audit import parse_dependency_audit_output, summarize_dependency_vulnerabilities
+from tools.language_support import build_dependency_audit_adapters, detect_language_profile
+from tools.static_context_builder import StaticContextBuilder
 from workflows.incident_debug import IncidentDebugWorkflow
 from workflows.maintenance_loop import MaintenanceLoopWorkflow
 from workflows.pull_request_maintenance import PullRequestMaintenanceWorkflow
@@ -86,16 +105,20 @@ class Orchestrator:
             command_runner=self.toolkit_factory.command_runner,
             logger=self.logger,
         )
+        self.static_context_builder = StaticContextBuilder(
+            toolkit_factory=self.toolkit_factory,
+            static_tooling=self.toolkit_factory.static_tooling,
+        )
         self.static_llm_client = build_llm_client(
-            self._agent_llm_config(config.agents.static.model),
+            self._agent_llm_config(config.agents.static),
             self.logger,
         )
         self.dynamic_llm_client = build_llm_client(
-            self._agent_llm_config(config.agents.dynamic.model),
+            self._agent_llm_config(config.agents.dynamic),
             self.logger,
         )
         self.maintenance_llm_client = build_llm_client(
-            self._agent_llm_config(config.agents.maintenance.model),
+            self._agent_llm_config(config.agents.maintenance),
             self.logger,
         )
         self.static_agent = StaticReviewAgent(
@@ -124,17 +147,27 @@ class Orchestrator:
         self._log_agent_runtime("dynamic_debug", self.dynamic_llm_client, config.agents.dynamic)
         self._log_agent_runtime("maintenance", self.maintenance_llm_client, config.agents.maintenance)
 
-    def _agent_llm_config(self, model_override: str | None) -> LLMConfig:
-        if not model_override:
-            return self.config.llm
+    def _agent_llm_config(self, runtime_config: AgentRuntimeConfig) -> LLMConfig:
+        provider = runtime_config.provider or self.config.llm.provider
+        inherited_base_url = (
+            self.config.llm.base_url
+            if provider == self.config.llm.provider
+            else default_base_url_for_provider(provider)
+        )
+        inherited_api_key_env = (
+            self.config.llm.api_key_env
+            if provider == self.config.llm.provider
+            else default_api_key_env_for_provider(provider)
+        )
         return LLMConfig(
-            provider=self.config.llm.provider,
-            model=model_override,
-            base_url=self.config.llm.base_url,
-            api_key_env=self.config.llm.api_key_env,
-            timeout_seconds=self.config.llm.timeout_seconds,
-            temperature=self.config.llm.temperature,
-            system_prompt=self.config.llm.system_prompt,
+            provider=provider,
+            model=runtime_config.model or self.config.llm.model,
+            base_url=runtime_config.base_url if runtime_config.base_url is not None else inherited_base_url,
+            api_key_env=runtime_config.api_key_env if runtime_config.api_key_env is not None else inherited_api_key_env,
+            timeout_seconds=runtime_config.timeout_seconds or self.config.llm.timeout_seconds,
+            temperature=runtime_config.temperature if runtime_config.temperature is not None else self.config.llm.temperature,
+            max_retries=self.config.llm.max_retries,
+            system_prompt=runtime_config.system_prompt or self.config.llm.system_prompt,
         )
 
     def _log_agent_runtime(
@@ -144,10 +177,13 @@ class Orchestrator:
         runtime_config: AgentRuntimeConfig,
     ) -> None:
         self.logger.info(
-            "Agent runtime ready: agent=%s client=%s model=%s max_steps=%s max_tool_calls=%s tools=%s",
+            "Agent runtime ready: agent=%s provider=%s client=%s model=%s base_url_custom=%s strict_failure=%s max_steps=%s max_tool_calls=%s tools=%s",
             agent_name,
+            self._llm_provider_name(llm_client),
             type(llm_client).__name__,
-            runtime_config.model or self.config.llm.model,
+            runtime_config.model or self._agent_llm_config(runtime_config).model,
+            bool(getattr(llm_client, "config", None) and getattr(llm_client.config, "base_url", None)),
+            True,
             runtime_config.max_steps,
             runtime_config.max_tool_calls,
             ",".join(runtime_config.allowed_tools),
@@ -241,6 +277,10 @@ class Orchestrator:
                 task_type=task.task_type,
                 status=TaskStatus.FAILED,
                 summary=f"Task failed: {exc}",
+                artifacts={
+                    "failure_reason": str(exc),
+                    "llm_failure_reason": str(exc),
+                },
                 errors=[str(exc)],
             )
         if context.config.log_agent_activity:
@@ -307,6 +347,12 @@ class Orchestrator:
             active_skills, candidate_skills = await self._prepare_run_skills(self.config.repo_root)
             snapshot, change_set = await self.scan_repository()
             await self.state_store.save_snapshot(run_id, snapshot)
+            review_targets = sorted(set(change_set.added_files + change_set.changed_files))
+            static_context = await self._build_static_context(
+                repo_root=Path(environment.base_workspace_root) if environment is not None else self.config.repo_root,
+                targets=review_targets,
+                execution_environment=environment,
+            )
             analysis_root = (
                 Path(environment.base_workspace_root)
                 if environment is not None
@@ -319,14 +365,18 @@ class Orchestrator:
                 execution_environment=environment,
                 active_skill=active_skills.get(AgentKind.STATIC_REVIEW.value),
                 candidate_skill=candidate_skills.get(AgentKind.STATIC_REVIEW.value),
+                startup_topology=static_context.startup_topology,
+                project_topology=static_context.project_topology,
+                language_profile=static_context.language_profile,
+                static_context=static_context,
             )
             task = Task(
                 task_id=self.dispatcher._new_task_id(),
                 run_id=run_id,
                 agent_kind=AgentKind.STATIC_REVIEW,
                 task_type=TaskType.STATIC_REVIEW,
-                targets=sorted(set(change_set.added_files + change_set.changed_files)),
-                payload={},
+                targets=review_targets,
+                payload={"static_context": static_context},
             )
             result = await self.execute_task(task, context)
             candidate_skills = await self._refresh_candidate_skills(
@@ -347,6 +397,19 @@ class Orchestrator:
                 report_dir=str(Path(environment.report_dir)) if environment is not None else "",
                 metadata=self._environment_metadata(environment),
             )
+            report.metadata.update(
+                await self._dependency_audit_metadata(
+                    analysis_root=analysis_root,
+                    execution_environment=environment,
+                    static_context=static_context,
+                )
+            )
+            await self._enrich_report_for_persistence(
+                report,
+                analysis_root=analysis_root,
+            )
+            report.metadata.update(self._runtime_report_metadata(report))
+            report.metadata.update(self._static_context_metadata(static_context))
             report.metadata.update(
                 await self.skill_evolution.evaluate_report(
                     repo_root=str(self.config.repo_root),
@@ -552,6 +615,10 @@ class Orchestrator:
         execution_environment: ExecutionEnvironment | None = None,
         active_skill=None,
         candidate_skill=None,
+        startup_topology=None,
+        project_topology=None,
+        language_profile=None,
+        static_context: StaticContextBundle | None = None,
     ) -> RunContext:
         return RunContext(
             run_id=run_id,
@@ -564,6 +631,10 @@ class Orchestrator:
             execution_environment=execution_environment,
             active_skill=active_skill,
             candidate_skill=candidate_skill,
+            startup_topology=startup_topology,
+            project_topology=project_topology,
+            language_profile=language_profile,
+            static_context=static_context,
         )
 
     async def _prepare_execution_environment(
@@ -650,6 +721,7 @@ class Orchestrator:
             "dependency_sources": list(environment.detected_sources),
             "install_commands": list(environment.install_commands),
             "install_failures": list(environment.install_errors),
+            "environment_installer_summary": dict(environment.installer_summary),
             "runtime_root": environment.runtime_root,
             "venv_root": environment.venv_root,
             "base_workspace_root": environment.base_workspace_root,
@@ -660,17 +732,565 @@ class Orchestrator:
             "bootstrap_packages": list(environment.bootstrap_packages),
         }
 
+    async def _build_static_context(
+        self,
+        *,
+        repo_root: Path,
+        targets: list[str],
+        execution_environment: ExecutionEnvironment | None = None,
+    ) -> StaticContextBundle:
+        bundle = await self.static_context_builder.build(
+            repo_root=repo_root,
+            targets=targets,
+            config=self.config,
+            rules=self.rules,
+            execution_environment=execution_environment,
+        )
+        summary = bundle.summary()
+        self.logger.info(
+            "Static pre-context ready: target_count=%s top_target_count=%s startup_context_count=%s baseline_digest_count=%s primary_language=%s ecosystems=%s",
+            len(targets),
+            summary.get("top_target_count", 0),
+            summary.get("startup_context_count", 0),
+            summary.get("baseline_total_findings", 0),
+            summary.get("primary_language", "unknown"),
+            ",".join(summary.get("ecosystems", [])),
+        )
+        return bundle
+
+    def _static_context_metadata(
+        self,
+        static_context: StaticContextBundle | None,
+    ) -> dict[str, object]:
+        if static_context is None:
+            return {}
+        summary = static_context.summary()
+        return {
+            "static_context_summary": summary,
+            "language_profile_summary": {
+                "primary_language": static_context.language_profile.primary_language,
+                "languages": list(static_context.language_profile.languages),
+                "primary_ecosystem": static_context.language_profile.primary_ecosystem,
+                "ecosystems": list(static_context.language_profile.ecosystems),
+                "enabled_adapters": list(static_context.language_profile.enabled_adapters),
+                "generic_review": bool(static_context.language_profile.generic_review),
+            },
+            "project_topology_summary": summary.get("project_topology_summary", {}),
+            "tool_coverage_summary": summary.get("tool_coverage_summary", {}),
+            "generic_language_review": bool(static_context.language_profile.generic_review),
+        }
+
+    async def _dependency_audit_metadata(
+        self,
+        *,
+        analysis_root: Path,
+        execution_environment: ExecutionEnvironment | None,
+        static_context: StaticContextBundle | None = None,
+    ) -> dict[str, object]:
+        if self.config.static_review.dependency_audit_mode == "disabled":
+            return {
+                "dependency_audit_status": "disabled",
+                "dependency_vulnerabilities": [],
+                "dependency_vulnerability_summary": {"total": 0, "blockers": 0, "severity_counts": {}, "packages": []},
+                "dependency_vulnerability_count": 0,
+                "dependency_vulnerability_blocker_count": 0,
+                "dependency_audit_ecosystem": "disabled",
+            }
+        if execution_environment is None:
+            return {
+                "dependency_audit_status": "unavailable",
+                "dependency_audit_error": "execution-environment-unavailable",
+                "dependency_vulnerabilities": [],
+                "dependency_vulnerability_summary": {"total": 0, "blockers": 0, "severity_counts": {}, "packages": []},
+                "dependency_vulnerability_count": 0,
+                "dependency_vulnerability_blocker_count": 0,
+                "dependency_audit_ecosystem": "unavailable",
+            }
+
+        install_env = execution_environment.command_env()
+        language_profile = (
+            static_context.language_profile
+            if static_context is not None
+            else detect_language_profile(
+                analysis_root,
+                enabled_languages=self.config.static_review.language_adapters_enabled,
+            )
+        )
+        adapters = build_dependency_audit_adapters(
+            analysis_root,
+            language_profile=language_profile,
+            mode=self.config.static_review.dependency_audit_mode,
+            python_command=self.config.static_review.dependency_audit_command,
+        )
+        if not adapters:
+            return {
+                "dependency_audit_status": "unavailable",
+                "dependency_audit_error": "no-supported-ecosystem-or-adapter",
+                "dependency_vulnerabilities": [],
+                "dependency_vulnerability_summary": {"total": 0, "blockers": 0, "severity_counts": {}, "packages": []},
+                "dependency_vulnerability_count": 0,
+                "dependency_vulnerability_blocker_count": 0,
+                "dependency_audit_ecosystem": "unavailable",
+            }
+        vulnerabilities: list[dict[str, object]] = []
+        errors: list[str] = []
+        unavailable: list[str] = []
+        executed_ecosystems: list[str] = []
+        for adapter in adapters:
+            executable = shlex.split(adapter.command)[0]
+            if shutil.which(executable, path=install_env.get("PATH")) is None:
+                unavailable.append(f"{adapter.ecosystem}:{executable}-not-installed")
+                continue
+            result = await self.toolkit_factory.command_runner.run(
+                command=adapter.command,
+                cwd=analysis_root,
+                timeout_seconds=300,
+                env=install_env,
+            )
+            if result.returncode != 0:
+                error_text = result.stderr.strip() or result.stdout.strip() or f"exit-{result.returncode}"
+                errors.append(f"{adapter.ecosystem}:{error_text[:500]}")
+                continue
+            try:
+                vulnerabilities.extend(parse_dependency_audit_output(adapter.parser, result.stdout))
+                executed_ecosystems.append(adapter.ecosystem)
+            except Exception as exc:
+                errors.append(f"{adapter.ecosystem}:parse-error:{exc}")
+
+        summary = summarize_dependency_vulnerabilities(vulnerabilities)
+        if vulnerabilities:
+            status = "executed"
+        elif errors:
+            status = "failed"
+        elif unavailable:
+            status = "unavailable"
+        else:
+            status = "executed"
+        metadata: dict[str, object] = {
+            "dependency_audit_status": status,
+            "dependency_vulnerabilities": vulnerabilities,
+            "dependency_vulnerability_summary": summary,
+            "dependency_vulnerability_count": len(vulnerabilities),
+            "dependency_vulnerability_blocker_count": int(summary.get("blockers", 0)),
+            "dependency_audit_ecosystem": ",".join(executed_ecosystems) or ",".join(
+                adapter.ecosystem for adapter in adapters
+            ),
+        }
+        if errors:
+            metadata["dependency_audit_error"] = "; ".join(errors)[:2000]
+        elif unavailable and not vulnerabilities:
+            metadata["dependency_audit_error"] = "; ".join(unavailable)[:2000]
+        return metadata
+
+    async def _enrich_report_for_persistence(
+        self,
+        report: WorkflowReport,
+        *,
+        analysis_root: Path,
+        maintenance_root: Path | None = None,
+        validation_root: Path | None = None,
+    ) -> None:
+        await enrich_report_snippets(
+            report,
+            analysis_root=analysis_root,
+            maintenance_root=maintenance_root,
+            validation_root=validation_root,
+            file_store=self.file_store,
+        )
+
     async def _skill_report_metadata(self, state: WorkflowState, report: WorkflowReport) -> dict[str, object]:
         candidate_skills = await self._refresh_candidate_skills(
             state,
             self._source_repo_root(state),
         )
+        shadow_replays = await self._shadow_replay_candidates(state, report, candidate_skills)
         return await self.skill_evolution.evaluate_report(
             repo_root=str(self._source_repo_root(state)),
             report=report,
             active_skills=dict(state.get("active_skills", {})),
             candidate_skills=candidate_skills,
+            shadow_replays=shadow_replays,
         )
+
+    async def _shadow_replay_candidates(
+        self,
+        state: WorkflowState,
+        report: WorkflowReport,
+        candidate_skills: dict[str, object],
+    ) -> dict[str, dict[str, object]]:
+        if not self.config.skills.shadow_evaluation_enabled:
+            return {}
+
+        replays: dict[str, dict[str, object]] = {}
+        for agent_kind in AgentKind:
+            candidate = candidate_skills.get(agent_kind.value)
+            if candidate is None:
+                continue
+            if getattr(candidate, "cooldown_until", None) and candidate.cooldown_until > report.finished_at:
+                replays[agent_kind.value] = {
+                    "mode": "heuristic",
+                    "reasons": ["candidate-cooldown-active"],
+                }
+                continue
+            try:
+                replay = await self._shadow_replay_candidate(state, report, agent_kind, candidate)
+            except Exception as exc:
+                self.logger.warning(
+                    "Shadow replay failed: agent=%s candidate=%s error=%s",
+                    agent_kind.value,
+                    getattr(candidate, "version", "-"),
+                    exc,
+                )
+                replays[agent_kind.value] = {
+                    "mode": "heuristic",
+                    "reasons": [
+                        "shadow-replay-failed",
+                        str(exc),
+                    ],
+                }
+                continue
+            if replay:
+                replays[agent_kind.value] = replay
+        return replays
+
+    async def _shadow_replay_candidate(
+        self,
+        state: WorkflowState,
+        report: WorkflowReport,
+        agent_kind: AgentKind,
+        candidate_skill,
+    ) -> dict[str, object] | None:
+        task = self._primary_task_for_agent(state, agent_kind)
+        if task is None:
+            return None
+        working_root = await self._shadow_working_root(state, agent_kind)
+        context = self._build_context(
+            state["run_id"],
+            working_root,
+            repo_root=self._source_repo_root(state),
+            execution_environment=state.get("execution_environment"),
+            active_skill=candidate_skill.skill_pack,
+            candidate_skill=None,
+            startup_topology=state.get("startup_topology"),
+            project_topology=state.get("project_topology"),
+            language_profile=state.get("language_profile"),
+            static_context=state.get("static_context"),
+        )
+        shadow_task = Task(
+            task_id=f"{task.task_id}-shadow-{uuid4().hex[:8]}",
+            run_id=task.run_id,
+            agent_kind=task.agent_kind,
+            task_type=task.task_type,
+            targets=list(task.targets),
+            payload=dict(task.payload),
+        )
+        agent = {
+            AgentKind.STATIC_REVIEW: self.static_agent,
+            AgentKind.DYNAMIC_DEBUG: self.dynamic_agent,
+            AgentKind.MAINTENANCE: self.maintenance_agent,
+        }[agent_kind]
+        result = await agent.run(shadow_task, context)
+        return {
+            "mode": "replay",
+            "score": self.skill_evolution.score_result(agent_kind, report, result),
+            "reasons": [
+                "shadow-replay-completed",
+                result.summary,
+            ],
+        }
+
+    def _primary_task_for_agent(self, state: WorkflowState, agent_kind: AgentKind) -> Task | None:
+        mapping = {
+            AgentKind.STATIC_REVIEW: state.get("static_task"),
+            AgentKind.DYNAMIC_DEBUG: state.get("dynamic_task"),
+            AgentKind.MAINTENANCE: state.get("maintenance_task"),
+        }
+        return mapping.get(agent_kind)
+
+    async def _shadow_working_root(self, state: WorkflowState, agent_kind: AgentKind) -> Path:
+        if agent_kind == AgentKind.MAINTENANCE:
+            return await self.file_store.materialize_workspace_copy(self._maintenance_root(state))
+        return self._analysis_root(state)
+
+    def _runtime_report_metadata(self, report: WorkflowReport) -> dict[str, object]:
+        provider_map = {
+            "static_review": self._llm_provider_name(self.static_llm_client),
+            "dynamic_debug": self._llm_provider_name(self.dynamic_llm_client),
+            "maintenance": self._llm_provider_name(self.maintenance_llm_client),
+        }
+        model_map = {
+            "static_review": self.config.agents.static.model or self.config.llm.model,
+            "dynamic_debug": self.config.agents.dynamic.model or self.config.llm.model,
+            "maintenance": self.config.agents.maintenance.model or self.config.llm.model,
+        }
+        provider_values = set(provider_map.values())
+        model_values = set(model_map.values())
+        metadata = {
+            "actual_llm_provider": provider_values.pop() if len(provider_values) == 1 else "mixed",
+            "actual_llm_providers": provider_map,
+            "actual_llm_model": model_values.pop() if len(model_values) == 1 else "mixed",
+            "actual_llm_models": model_map,
+            "llm_failure_reason": self._llm_failure_reason(report),
+        }
+        metadata.update(self._resolution_metadata(report))
+        return metadata
+
+    def _llm_provider_name(self, client: object) -> str:
+        provider_name = getattr(client, "provider_name", None)
+        if isinstance(provider_name, str) and provider_name:
+            return provider_name
+        return type(client).__name__
+
+    def _llm_failure_reason(self, report: WorkflowReport) -> str:
+        results = [
+            result
+            for result in (
+                report.static_result,
+                report.dynamic_result,
+                report.maintenance_result,
+                *report.validation_results.values(),
+            )
+            if result is not None
+        ]
+        for result in results:
+            failure = str(result.artifacts.get("llm_failure_reason", "")).strip()
+            if failure:
+                return failure
+        return ""
+
+    def _resolution_metadata(self, report: WorkflowReport) -> dict[str, object]:
+        resolved: set[str] = set()
+        unresolved: set[str] = set()
+        regressed: set[str] = set()
+        for result in report.validation_results.values():
+            comparison = result.artifacts.get("comparison", {})
+            resolved.update(str(item) for item in comparison.get("resolved", []))
+            unresolved.update(str(item) for item in comparison.get("unresolved", []))
+            regressed.update(str(item) for item in comparison.get("regressed", []))
+
+        root_blockers = self._root_blockers(report)
+        root_blockers_by_class = self._group_blockers_by_class(root_blockers)
+        startup_metadata = self._startup_topology_metadata(report)
+        manual_follow_ups = self._manual_follow_ups(
+            report,
+            advisory_startup_handoffs=startup_metadata["advisory_startup_handoffs"],
+        )
+        repo_healthy = not root_blockers and not unresolved and not regressed
+        reasons: list[str] = []
+        root_blocker_classes = sorted(
+            {
+                str(item.get("root_cause_class"))
+                for item in root_blockers
+                if item.get("root_cause_class")
+            }
+        )
+        if root_blockers:
+            reasons.append("high_or_blocking_findings_remain")
+        if unresolved:
+            reasons.append("validated_findings_still_unresolved")
+        if regressed:
+            reasons.append("validation_regressions_detected")
+        if report.metadata.get("environment_degraded"):
+            reasons.append("execution_environment_degraded")
+        explanation = ""
+        if report.status == TaskStatus.SUCCEEDED and not repo_healthy:
+            explanation = (
+                "Workflow execution completed, but the repository is still unhealthy because "
+                + ", ".join(reasons)
+                + "."
+            )
+        return {
+            "resolution_summary": {
+                "resolved": len(resolved),
+                "unresolved": len(unresolved),
+                "regressed": len(regressed),
+                "repo_healthy": repo_healthy,
+                "root_blocker_classes": root_blocker_classes,
+                "root_blockers_by_class": root_blockers_by_class,
+                "workflow_succeeded_but_repo_unhealthy": bool(explanation),
+                "explanation": explanation,
+            },
+            "root_blockers": root_blockers,
+            "manual_follow_ups": manual_follow_ups,
+            "auto_fixed_blockers": list(
+                report.maintenance_result.artifacts.get("auto_fixed_blockers", [])
+                if report.maintenance_result is not None
+                else []
+            ),
+            "startup_topology_summary": startup_metadata["startup_topology_summary"],
+            "confirmed_startup_blockers": startup_metadata["confirmed_startup_blockers"],
+            "advisory_startup_handoffs": startup_metadata["advisory_startup_handoffs"],
+            "environment_degraded_reason_summary": (
+                "; ".join(str(item) for item in report.metadata.get("install_failures", []))
+                if report.metadata.get("environment_degraded")
+                else ""
+            ),
+        }
+
+    def _group_blockers_by_class(self, blockers: list[dict[str, object]]) -> dict[str, int]:
+        grouped: dict[str, int] = {}
+        for blocker in blockers:
+            name = str(blocker.get("root_cause_class") or "unknown")
+            grouped[name] = grouped.get(name, 0) + 1
+        return grouped
+
+    def _root_blockers(self, report: WorkflowReport) -> list[dict[str, object]]:
+        blockers: list[dict[str, object]] = []
+        sources = list(report.validation_results.values()) or [
+            item for item in (report.static_result, report.dynamic_result) if item is not None
+        ]
+        for result in sources:
+            for finding in result.findings:
+                if not self._is_root_blocker_finding(finding):
+                    continue
+                blockers.append(
+                    {
+                        "fingerprint": finding.fingerprint,
+                        "source_agent": finding.source_agent.value,
+                        "severity": finding.severity.value,
+                        "rule_id": finding.rule_id,
+                        "message": finding.message,
+                        "path": finding.path,
+                        "line": finding.line,
+                        "root_cause_class": finding.root_cause_class,
+                        "startup_context": str(finding.evidence.get("startup_context", "")) or None,
+                        "entrypoint_path": str(finding.evidence.get("matched_entrypoint", "")) or None,
+                        "config_anchor_path": str(finding.evidence.get("matched_config_anchor", "")) or None,
+                        "repair_hint": str(finding.evidence.get("repair_hint", "")) or None,
+                    }
+                )
+        if report.maintenance_result is not None:
+            for handoff in report.maintenance_result.artifacts.get("unresolved_handoffs", [])[:10]:
+                if not isinstance(handoff, dict):
+                    continue
+                blockers.append(
+                    {
+                        "fingerprint": "|".join(
+                            [
+                                "maintenance",
+                                str(handoff.get("kind", "")),
+                                str(handoff.get("reason", "unresolved-handoff")),
+                                str(handoff.get("message", handoff.get("reason", "Unresolved maintenance blocker"))),
+                            ]
+                        ),
+                        "source_agent": AgentKind.MAINTENANCE.value,
+                        "severity": Severity.HIGH.value,
+                        "rule_id": str(handoff.get("reason", "unresolved-handoff")),
+                        "message": str(handoff.get("message", handoff.get("reason", "Unresolved maintenance blocker"))),
+                        "path": None,
+                        "root_cause_class": str(handoff.get("kind", "")) or None,
+                        "guidance": str(handoff.get("guidance", "")) or None,
+                    }
+                )
+        for vulnerability in report.metadata.get("dependency_vulnerabilities", []):
+            if not isinstance(vulnerability, dict) or not bool(vulnerability.get("blocker", False)):
+                continue
+            package_name = str(vulnerability.get("package_name", "")).strip()
+            installed_version = str(vulnerability.get("installed_version", "")).strip()
+            vulnerability_id = str(vulnerability.get("vulnerability_id", "unknown-vulnerability")).strip()
+            fixed_versions = [
+                str(item).strip()
+                for item in vulnerability.get("fix_versions", []) or []
+                if str(item).strip()
+            ]
+            blockers.append(
+                {
+                    "fingerprint": "|".join(
+                        [
+                            "dependency",
+                            package_name,
+                            installed_version,
+                            vulnerability_id,
+                        ]
+                    ),
+                    "source_agent": "dependency_audit",
+                    "severity": str(vulnerability.get("severity", "medium")),
+                    "rule_id": vulnerability_id,
+                    "message": (
+                        f"{package_name} {installed_version} is affected by {vulnerability_id}: "
+                        f"{str(vulnerability.get('summary', vulnerability_id)).strip()}"
+                    ).strip(),
+                    "path": package_name or None,
+                    "root_cause_class": "dependency",
+                    "guidance": (
+                        f"Upgrade to one of: {', '.join(fixed_versions)}"
+                        if fixed_versions
+                        else None
+                    ),
+                    "package_name": package_name or None,
+                    "installed_version": installed_version or None,
+                    "fixed_versions": fixed_versions,
+                }
+            )
+        deduped: list[dict[str, object]] = []
+        seen: set[str] = set()
+        for item in blockers:
+            key = str(item.get("fingerprint", "")).strip() or "|".join(
+                [
+                    str(item.get("source_agent", "")),
+                    str(item.get("rule_id", "")),
+                    str(item.get("message", "")),
+                ]
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+        return deduped[:10]
+
+    def _manual_follow_ups(
+        self,
+        report: WorkflowReport,
+        *,
+        advisory_startup_handoffs: list[dict[str, object]] | None = None,
+    ) -> list[dict[str, object]]:
+        follow_ups: list[dict[str, object]] = []
+        seen: set[tuple[str, str, str]] = set()
+        if report.maintenance_result is not None:
+            for item in report.maintenance_result.artifacts.get("unresolved_handoffs", [])[:20]:
+                if not isinstance(item, dict):
+                    continue
+                reason = str(item.get("reason", "unresolved-handoff"))
+                message = str(item.get("message", reason))
+                guidance = str(item.get("guidance", "")).strip()
+                key = (str(item.get("kind", "")), reason, message)
+                if key in seen:
+                    continue
+                seen.add(key)
+                follow_ups.append(
+                    {
+                        "kind": str(item.get("kind", "")) or "unknown",
+                        "reason": reason,
+                        "message": message,
+                        "guidance": guidance,
+                        "startup_context": str(item.get("startup_context", "")) or None,
+                        "entrypoint_path": str(item.get("entrypoint_path", "")) or None,
+                        "config_anchor_path": str(item.get("config_anchor_path", "")) or None,
+                    }
+                )
+        for item in advisory_startup_handoffs or []:
+            reason = str(item.get("reason", "startup-topology-advisory"))
+            message = str(item.get("message", reason))
+            key = (str(item.get("kind", "")), reason, message)
+            if key in seen:
+                continue
+            seen.add(key)
+            follow_ups.append(item)
+        return follow_ups[:10]
+
+    def _is_root_blocker_finding(self, finding: Finding) -> bool:
+        if bool(finding.evidence.get("advisory", False)):
+            return False
+        if finding.severity in {Severity.HIGH, Severity.CRITICAL}:
+            return True
+        return finding.root_cause_class in {
+            "dependency",
+            "config",
+            "startup",
+            "environment",
+            "runtime",
+            "application",
+        }
 
     def _dynamic_commands(self) -> list[str]:
         return [*self.config.dynamic_debug.smoke_commands, *self.config.dynamic_debug.test_commands]
@@ -687,8 +1307,7 @@ class Orchestrator:
         graph.add_node("persist_report", self._node_persist_maintenance_report)
         graph.add_edge(START, "scan")
         graph.add_edge("scan", "static_review")
-        graph.add_edge("scan", "dynamic_debug")
-        graph.add_edge("static_review", "feedback_merge")
+        graph.add_edge("static_review", "dynamic_debug")
         graph.add_edge("dynamic_debug", "feedback_merge")
         graph.add_edge("feedback_merge", "maintenance")
         graph.add_edge("maintenance", "static_validate")
@@ -727,8 +1346,7 @@ class Orchestrator:
         graph.add_edge("load_pr_context", "checkout_pr_repo")
         graph.add_edge("checkout_pr_repo", "scan_pr_repo")
         graph.add_edge("scan_pr_repo", "static_review")
-        graph.add_edge("scan_pr_repo", "dynamic_debug")
-        graph.add_edge("static_review", "feedback_merge")
+        graph.add_edge("static_review", "dynamic_debug")
         graph.add_edge("dynamic_debug", "feedback_merge")
         graph.add_edge("feedback_merge", "maintenance")
         graph.add_edge("maintenance", "static_validate")
@@ -746,14 +1364,29 @@ class Orchestrator:
         snapshot, change_set = await self.scan_repository()
         await self.state_store.save_snapshot(state["run_id"], snapshot)
         review_targets = sorted(set(change_set.changed_files + change_set.added_files))
+        analysis_root = (
+            Path(environment.base_workspace_root)
+            if environment is not None
+            else self.config.repo_root
+        )
+        static_context = await self._build_static_context(
+            repo_root=analysis_root,
+            targets=review_targets,
+            execution_environment=environment,
+        )
         static_task, dynamic_task = self.dispatcher.create_review_tasks(
             run_id=state["run_id"],
             targets=review_targets,
             commands=self._dynamic_commands(),
+            static_context=static_context,
         )
         return {
             "snapshot": snapshot,
             "change_set": change_set,
+            "startup_topology": static_context.startup_topology,
+            "project_topology": static_context.project_topology,
+            "language_profile": static_context.language_profile,
+            "static_context": static_context,
             "static_task": static_task,
             "dynamic_task": dynamic_task,
             "execution_environment": environment,
@@ -813,14 +1446,29 @@ class Orchestrator:
         snapshot, change_set = await self.scan_repository(source_root, state["pr_context"])
         await self.state_store.save_snapshot(state["run_id"], snapshot)
         review_targets = sorted(set(change_set.changed_files + change_set.added_files))
+        analysis_root = (
+            Path(environment.base_workspace_root)
+            if environment is not None
+            else source_root
+        )
+        static_context = await self._build_static_context(
+            repo_root=analysis_root,
+            targets=review_targets,
+            execution_environment=environment,
+        )
         static_task, dynamic_task = self.dispatcher.create_review_tasks(
             run_id=state["run_id"],
             targets=review_targets,
             commands=self._dynamic_commands(),
+            static_context=static_context,
         )
         return {
             "snapshot": snapshot,
             "change_set": change_set,
+            "startup_topology": static_context.startup_topology,
+            "project_topology": static_context.project_topology,
+            "language_profile": static_context.language_profile,
+            "static_context": static_context,
             "static_task": static_task,
             "dynamic_task": dynamic_task,
             "execution_environment": environment,
@@ -840,11 +1488,20 @@ class Orchestrator:
             execution_environment=state.get("execution_environment"),
             active_skill=active_skill,
             candidate_skill=candidate_skill,
+            startup_topology=state.get("startup_topology"),
+            project_topology=state.get("project_topology"),
+            language_profile=state.get("language_profile"),
+            static_context=state.get("static_context"),
         )
         result = await self.execute_task(task, context)
         if task.task_type == TaskType.VALIDATION_STATIC:
             return {"validation_static_result": result}
-        return {"static_result": result}
+        return {
+            "static_result": result,
+            "startup_topology": result.artifacts.get("startup_topology") or state.get("startup_topology"),
+            "project_topology": result.artifacts.get("project_topology") or state.get("project_topology"),
+            "language_profile": result.artifacts.get("language_profile") or state.get("language_profile"),
+        }
 
     async def _node_dynamic_debug(self, state: WorkflowState) -> WorkflowState:
         task = state["validation_dynamic_task"] if "validation_dynamic_task" in state else state["dynamic_task"]
@@ -857,6 +1514,10 @@ class Orchestrator:
             execution_environment=state.get("execution_environment"),
             active_skill=active_skill,
             candidate_skill=candidate_skill,
+            startup_topology=state.get("startup_topology"),
+            project_topology=state.get("project_topology"),
+            language_profile=state.get("language_profile"),
+            static_context=state.get("static_context"),
         )
         result = await self.execute_task(task, context)
         if task.task_type == TaskType.VALIDATION_DYNAMIC:
@@ -892,6 +1553,7 @@ class Orchestrator:
             state["run_id"],
             feedback,
             handoffs=handoffs,
+            startup_topology=state.get("startup_topology"),
         )
         return {
             "feedback": feedback,
@@ -913,6 +1575,10 @@ class Orchestrator:
             execution_environment=state.get("execution_environment"),
             active_skill=active_skill,
             candidate_skill=candidate_skill,
+            startup_topology=state.get("startup_topology"),
+            project_topology=state.get("project_topology"),
+            language_profile=state.get("language_profile"),
+            static_context=state.get("static_context"),
         )
         result = await self.execute_task(state["maintenance_task"], context)
         updates: WorkflowState = {
@@ -972,6 +1638,395 @@ class Orchestrator:
                 )
             }
         return await self._node_dynamic_debug(state)
+
+    async def _maybe_followup_maintenance_round(self, state: WorkflowState) -> None:
+        if state.get("artifacts", {}).get("repair_rounds", 1) >= 2:
+            return
+        followup_handoffs = self._followup_handoffs_from_validation(state)
+        if not followup_handoffs:
+            return
+
+        feedback = FeedbackBundle(
+            snapshot=state.get("validation_snapshot", state["snapshot"]),
+            change_set=state["change_set"],
+            static_findings=state["validation_static_result"].findings,
+            dynamic_findings=state["validation_dynamic_result"].findings,
+        )
+        maintenance_task = self.dispatcher.create_maintenance_task(
+            state["run_id"],
+            feedback,
+            handoffs=followup_handoffs,
+            startup_topology=state.get("startup_topology"),
+        )
+        maintenance_root = self._maintenance_root(state)
+        active_skill, candidate_skill = self._skill_for_agent(state, AgentKind.MAINTENANCE)
+        context = self._build_context(
+            state["run_id"],
+            maintenance_root,
+            repo_root=self._source_repo_root(state),
+            execution_environment=state.get("execution_environment"),
+            active_skill=active_skill,
+            candidate_skill=candidate_skill,
+            startup_topology=state.get("startup_topology"),
+            project_topology=state.get("project_topology"),
+            language_profile=state.get("language_profile"),
+            static_context=state.get("static_context"),
+        )
+        followup_result = await self.execute_task(maintenance_task, context)
+        merged_result = self._merge_maintenance_results(
+            state["maintenance_result"],
+            followup_result,
+        )
+        state["maintenance_task"] = maintenance_task
+        state["maintenance_result"] = merged_result
+        state["artifacts"] = {
+            **dict(state.get("artifacts", {})),
+            "repair_rounds": 2,
+            "followup_handoff_count": len(followup_handoffs),
+        }
+
+        if followup_result.patch is None or not followup_result.patch.file_patches:
+            return
+
+        await self.patch_service.apply(maintenance_root, followup_result.patch)
+        if state.get("execution_environment") is not None:
+            validation_workspace_root = await self.environment_manager.refresh_validation_workspace(
+                state["execution_environment"]
+            )
+        else:
+            validation_workspace_root = Path(state["validation_workspace_root"])
+            await self.patch_service.apply(validation_workspace_root, followup_result.patch)
+        state["validation_workspace_root"] = str(validation_workspace_root)
+        state["validation_snapshot"] = await self.scanner.scan(validation_workspace_root)
+        static_task, dynamic_task = self.dispatcher.create_validation_tasks(
+            run_id=state["run_id"],
+            patch=merged_result.patch or followup_result.patch,
+            commands=self._dynamic_commands(),
+        )
+        state["validation_static_task"] = static_task
+        state["validation_dynamic_task"] = dynamic_task
+        validation_static = await self._node_static_review(state)
+        validation_dynamic = await self._node_dynamic_debug(state)
+        state["validation_static_result"] = validation_static["validation_static_result"]
+        state["validation_dynamic_result"] = validation_dynamic["validation_dynamic_result"]
+
+    def _followup_handoffs_from_validation(self, state: WorkflowState) -> list[dict[str, object]]:
+        handoffs: list[dict[str, object]] = []
+        for result in (
+            state.get("validation_dynamic_result"),
+            state.get("validation_static_result"),
+        ):
+            if result is None:
+                continue
+            for finding in result.findings:
+                if not self._is_followup_finding(finding):
+                    continue
+                handoffs.append(
+                    {
+                        "source_agent": finding.source_agent.value,
+                        "title": f"Follow up {finding.root_cause_class or finding.category} blocker",
+                        "description": finding.message,
+                        "recommended_change": self._followup_recommended_change(finding),
+                        "severity": finding.severity.value,
+                        "kind": (
+                            finding.root_cause_class
+                            if finding.root_cause_class in {"dependency", "config", "startup", "runtime"}
+                            else "code"
+                        ),
+                        "confidence": 0.9 if finding.root_cause_class in {"dependency", "config", "startup"} else 0.75,
+                        "affected_files": [finding.path] if finding.path else [],
+                        "metadata": {
+                            "rule_id": finding.rule_id,
+                            "category": finding.category,
+                            "root_cause_class": finding.root_cause_class,
+                        },
+                        "evidence": [
+                            {
+                                "kind": "validation-finding",
+                                "title": finding.rule_id,
+                                "summary": finding.message,
+                                "path": finding.path,
+                                "data": finding.evidence,
+                            }
+                        ],
+                    }
+                )
+        unresolved_handoffs = state["maintenance_result"].artifacts.get("unresolved_handoffs", [])
+        for item in unresolved_handoffs:
+            if not isinstance(item, dict):
+                continue
+            handoffs.append(
+                {
+                    "source_agent": AgentKind.MAINTENANCE.value,
+                    "title": f"Follow up {item.get('kind', 'maintenance')} blocker",
+                    "description": str(item.get("message", item.get("reason", "Unresolved maintenance blocker"))),
+                    "recommended_change": "Apply a targeted manifest or configuration fix for the unresolved blocker.",
+                    "severity": Severity.HIGH.value,
+                    "kind": str(item.get("kind", "code")),
+                    "confidence": 0.8,
+                    "affected_files": [],
+                    "metadata": {
+                        "rule_id": str(item.get("reason", "unresolved-handoff")),
+                        "root_cause_class": str(item.get("kind", "")) or None,
+                    },
+                    "evidence": [],
+                }
+            )
+
+        deduped: list[dict[str, object]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for item in handoffs:
+            key = (
+                str(item.get("kind", "")),
+                str(item.get("title", "")),
+                str(item.get("description", "")),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+        return deduped[:6]
+
+    def _is_followup_finding(self, finding: Finding) -> bool:
+        if bool(finding.evidence.get("advisory", False)):
+            return False
+        if finding.root_cause_class in {"dependency", "config", "startup", "environment"}:
+            return True
+        return finding.severity in {Severity.HIGH, Severity.CRITICAL}
+
+    def _startup_topology_metadata(self, report: WorkflowReport) -> dict[str, object]:
+        topology_value = None
+        if report.static_result is not None:
+            topology_value = report.static_result.artifacts.get("startup_topology")
+        topology = to_jsonable(topology_value) if topology_value is not None else {}
+        entrypoints = [
+            item for item in topology.get("entrypoints", [])
+            if isinstance(item, dict)
+        ] if isinstance(topology, dict) else []
+        anchors = [
+            item for item in topology.get("config_anchors", [])
+            if isinstance(item, dict)
+        ] if isinstance(topology, dict) else []
+        confirmed = self._confirmed_startup_blockers(report)
+        advisory = self._advisory_startup_handoffs(report, confirmed)
+        contexts = sorted(
+            {
+                str(item.get("context"))
+                for item in [*entrypoints, *anchors]
+                if item.get("context")
+            }
+        )
+        return {
+            "startup_topology_summary": {
+                "src_layout": bool(topology.get("src_layout", False)) if isinstance(topology, dict) else False,
+                "entrypoint_count": len(entrypoints),
+                "config_anchor_count": len(anchors),
+                "contexts": contexts,
+                "entrypoints": entrypoints,
+                "config_anchors": anchors,
+                "repair_hints": list(topology.get("repair_hints", [])) if isinstance(topology, dict) else [],
+                "confirmed_count": len(confirmed),
+                "advisory_count": len(advisory),
+            },
+            "confirmed_startup_blockers": confirmed,
+            "advisory_startup_handoffs": advisory,
+        }
+
+    def _confirmed_startup_blockers(self, report: WorkflowReport) -> list[dict[str, object]]:
+        candidates: list[tuple[str, AgentResult]] = []
+        if report.dynamic_result is not None:
+            candidates.append(("analysis", report.dynamic_result))
+        validation_dynamic = report.validation_results.get("dynamic_validation")
+        if validation_dynamic is not None:
+            candidates.append(("validation", validation_dynamic))
+
+        confirmed: list[dict[str, object]] = []
+        seen: set[tuple[str, str, str, str]] = set()
+        for phase, result in candidates:
+            for finding in result.findings:
+                if finding.root_cause_class != "startup":
+                    continue
+                entrypoint_path = str(finding.evidence.get("matched_entrypoint", "")).strip()
+                config_anchor_path = str(finding.evidence.get("matched_config_anchor", "")).strip()
+                startup_context = str(finding.evidence.get("startup_context", "")).strip()
+                if not entrypoint_path and not config_anchor_path and not startup_context:
+                    continue
+                key = (
+                    startup_context,
+                    entrypoint_path,
+                    config_anchor_path,
+                    str(finding.evidence.get("repair_hint", "")).strip(),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                confirmed.append(
+                    {
+                        "phase": phase,
+                        "source_agent": finding.source_agent.value,
+                        "severity": finding.severity.value,
+                        "rule_id": finding.rule_id,
+                        "message": finding.message,
+                        "startup_context": startup_context or None,
+                        "entrypoint_path": entrypoint_path or None,
+                        "config_anchor_path": config_anchor_path or None,
+                        "repair_hint": str(finding.evidence.get("repair_hint", "")).strip() or None,
+                    }
+                )
+        return confirmed
+
+    def _advisory_startup_handoffs(
+        self,
+        report: WorkflowReport,
+        confirmed_startup_blockers: list[dict[str, object]],
+    ) -> list[dict[str, object]]:
+        if report.static_result is None:
+            return []
+        advisory_items = report.static_result.artifacts.get("startup_handoffs", [])
+        if not isinstance(advisory_items, list):
+            return []
+        confirmed_keys = {
+            (
+                str(item.get("startup_context", "") or ""),
+                str(item.get("entrypoint_path", "") or ""),
+                str(item.get("config_anchor_path", "") or ""),
+                str(item.get("repair_hint", "") or ""),
+            )
+            for item in confirmed_startup_blockers
+        }
+        advisory: list[dict[str, object]] = []
+        seen: set[tuple[str, str, str, str]] = set()
+        for handoff in advisory_items:
+            if not isinstance(handoff, dict):
+                continue
+            metadata = handoff.get("metadata", {})
+            metadata = metadata if isinstance(metadata, dict) else {}
+            key = (
+                str(metadata.get("startup_context", "") or ""),
+                str(metadata.get("entrypoint_path", "") or ""),
+                str(metadata.get("config_anchor_path", "") or ""),
+                str(metadata.get("repair_hint", "") or ""),
+            )
+            if key in confirmed_keys or key in seen:
+                continue
+            seen.add(key)
+            advisory.append(
+                {
+                    "kind": "startup",
+                    "reason": "startup-topology-advisory",
+                    "message": str(handoff.get("description", handoff.get("title", "Startup topology advisory"))),
+                    "guidance": str(handoff.get("recommended_change", "")).strip(),
+                    "startup_context": key[0] or None,
+                    "entrypoint_path": key[1] or None,
+                    "config_anchor_path": key[2] or None,
+                    "repair_hint": key[3] or None,
+                }
+            )
+        return advisory
+
+    def _followup_recommended_change(self, finding: Finding) -> str:
+        if finding.root_cause_class == "dependency":
+            return "Apply a dependency declaration fix in the project manifest or requirements file, then re-run validation."
+        if finding.root_cause_class == "config":
+            return "Apply a configuration or environment placeholder fix and re-run validation."
+        if finding.root_cause_class == "startup":
+            return "Apply a startup/bootstrap fix for the Python test entrypoint or path configuration, then re-run validation."
+        if finding.root_cause_class == "environment":
+            return "Stabilize the validation environment or bootstrap requirements before rerunning the check."
+        return "Address the blocking validation finding with a focused follow-up patch."
+
+    def _merge_maintenance_results(
+        self,
+        current: AgentResult,
+        followup: AgentResult,
+    ) -> AgentResult:
+        merged_patch = self._merge_patch_proposals(current.patch, followup.patch)
+        current_unresolved = list(current.artifacts.get("unresolved_handoffs", []))
+        followup_unresolved = list(followup.artifacts.get("unresolved_handoffs", []))
+        artifacts = {
+            **current.artifacts,
+            **followup.artifacts,
+            "repair_rounds": 2,
+            "unresolved_handoffs": followup_unresolved or current_unresolved,
+            "auto_fixed_blockers": sorted(
+                {
+                    *current.artifacts.get("auto_fixed_blockers", []),
+                    *followup.artifacts.get("auto_fixed_blockers", []),
+                }
+            ),
+        }
+        return AgentResult(
+            task_id=followup.task_id,
+            agent_kind=followup.agent_kind,
+            task_type=followup.task_type,
+            status=followup.status if followup.status == TaskStatus.FAILED else current.status,
+            summary=followup.summary or current.summary,
+            findings=followup.findings or current.findings,
+            patch=merged_patch,
+            artifacts=artifacts,
+            errors=[*current.errors, *followup.errors],
+        )
+
+    def _merge_patch_proposals(
+        self,
+        current: PatchProposal | None,
+        followup: PatchProposal | None,
+    ) -> PatchProposal | None:
+        if current is None:
+            return followup
+        if followup is None:
+            return current
+        merged_by_path: dict[str, FilePatch] = {item.path: item for item in current.file_patches}
+        for patch in followup.file_patches:
+            if patch.path in merged_by_path:
+                original = merged_by_path[patch.path]
+                merged_by_path[patch.path] = FilePatch(
+                    path=patch.path,
+                    old_content=original.old_content,
+                    new_content=patch.new_content,
+                    diff=self.patch_service.build_file_patch(
+                        patch.path,
+                        original.old_content,
+                        patch.new_content,
+                    ).diff,
+                )
+            else:
+                merged_by_path[patch.path] = patch
+        merged_file_patches = [merged_by_path[path] for path in sorted(merged_by_path)]
+        metadata = {
+            **current.metadata,
+            **followup.metadata,
+            "repair_scope": sorted(
+                {
+                    *current.metadata.get("repair_scope", []),
+                    *followup.metadata.get("repair_scope", []),
+                }
+            ),
+            "unresolved_handoffs": list(
+                followup.metadata.get("unresolved_handoffs", current.metadata.get("unresolved_handoffs", []))
+            ),
+            "auto_fixed_blockers": sorted(
+                {
+                    *current.metadata.get("auto_fixed_blockers", []),
+                    *followup.metadata.get("auto_fixed_blockers", []),
+                }
+            ),
+        }
+        return PatchProposal(
+            summary=followup.summary or current.summary,
+            rationale="\n".join(item for item in [current.rationale, followup.rationale] if item).strip(),
+            file_patches=merged_file_patches,
+            validation_targets=sorted(
+                {
+                    *current.validation_targets,
+                    *followup.validation_targets,
+                }
+            ),
+            suggestions=list(dict.fromkeys([*current.suggestions, *followup.suggestions])),
+            metadata=metadata,
+            applied=current.applied or followup.applied,
+            diff_text=self.patch_service.render_patch(merged_file_patches),
+        )
 
     async def _node_assess_publishability(self, state: WorkflowState) -> WorkflowState:
         reasons = list(state["maintenance_result"].artifacts.get("unpublishable_reasons", []))
@@ -1035,6 +2090,7 @@ class Orchestrator:
         }
 
     async def _node_persist_maintenance_report(self, state: WorkflowState) -> WorkflowState:
+        await self._maybe_followup_maintenance_round(state)
         validation_results = {
             "static_validation": state["validation_static_result"],
             "dynamic_validation": state["validation_dynamic_result"],
@@ -1083,6 +2139,21 @@ class Orchestrator:
             report_dir=str(state.get("report_dir", "")),
             metadata=self._environment_metadata(state.get("execution_environment")),
         )
+        report.metadata.update(
+            await self._dependency_audit_metadata(
+                analysis_root=self._analysis_root(state),
+                execution_environment=state.get("execution_environment"),
+                static_context=state.get("static_context"),
+            )
+        )
+        await self._enrich_report_for_persistence(
+            report,
+            analysis_root=self._analysis_root(state),
+            maintenance_root=self._maintenance_root(state),
+            validation_root=self._validation_root(state),
+        )
+        report.metadata.update(self._runtime_report_metadata(report))
+        report.metadata.update(self._static_context_metadata(state.get("static_context")))
         report.metadata.update(await self._skill_report_metadata(state, report))
         report_dir = await self._write_report_artifacts(report)
         report.report_dir = str(report_dir)
@@ -1113,6 +2184,12 @@ class Orchestrator:
             report_dir=str(state.get("report_dir", "")),
             metadata=self._environment_metadata(state.get("execution_environment")),
         )
+        await self._enrich_report_for_persistence(
+            report,
+            analysis_root=self._analysis_root(state),
+        )
+        report.metadata.update(self._runtime_report_metadata(report))
+        report.metadata.update(self._static_context_metadata(state.get("static_context")))
         report.metadata.update(await self._skill_report_metadata(state, report))
         report_dir = await self._write_report_artifacts(report)
         report.report_dir = str(report_dir)
@@ -1125,6 +2202,7 @@ class Orchestrator:
         return {"report": report, "report_dir": str(report_dir)}
 
     async def _node_persist_pr_report(self, state: WorkflowState) -> WorkflowState:
+        await self._maybe_followup_maintenance_round(state)
         validation_results = {
             "static_validation": state["validation_static_result"],
             "dynamic_validation": state["validation_dynamic_result"],
@@ -1160,6 +2238,21 @@ class Orchestrator:
         }
         metadata.update(self._environment_metadata(state.get("execution_environment")))
         report = self._build_pr_report(state, metadata=metadata)
+        report.metadata.update(
+            await self._dependency_audit_metadata(
+                analysis_root=self._analysis_root(state),
+                execution_environment=state.get("execution_environment"),
+                static_context=state.get("static_context"),
+            )
+        )
+        await self._enrich_report_for_persistence(
+            report,
+            analysis_root=self._analysis_root(state),
+            maintenance_root=self._maintenance_root(state),
+            validation_root=self._validation_root(state),
+        )
+        report.metadata.update(self._runtime_report_metadata(report))
+        report.metadata.update(self._static_context_metadata(state.get("static_context")))
         report.metadata.update(await self._skill_report_metadata(state, report))
         report_dir = await self._write_report_artifacts(report)
         report.report_dir = str(report_dir)
@@ -1255,6 +2348,7 @@ class Orchestrator:
             ArtifactReference(name="summary_md", path="summary.md"),
             ArtifactReference(name="report_json", path="report.json"),
             ArtifactReference(name="findings_json", path="findings.json"),
+            ArtifactReference(name="dependency_vulnerabilities_json", path="artifacts/dependency_vulnerabilities.json"),
             ArtifactReference(name="environment_json", path="artifacts/environment.json"),
             ArtifactReference(name="install_log", path="artifacts/install.log"),
         ]
@@ -1300,15 +2394,25 @@ class Orchestrator:
         report_dir = Path(report.report_dir) if report.report_dir else self.config.reports_dir / report.run_id
         await self.file_store.ensure_dir(report_dir)
         report.report_dir = str(report_dir)
+        await self.file_store.ensure_dir(report_dir / "artifacts")
         await write_markdown(report_dir / "summary.md", report)
         await write_json(report_dir / "report.json", report)
         await write_json(report_dir / "findings.json", report.all_findings)
+        if "dependency_audit_status" in report.metadata:
+            await write_json(
+                report_dir / "artifacts" / "dependency_vulnerabilities.json",
+                {
+                    "status": report.metadata.get("dependency_audit_status", "not-run"),
+                    "error": report.metadata.get("dependency_audit_error", ""),
+                    "summary": report.metadata.get("dependency_vulnerability_summary", {}),
+                    "vulnerabilities": report.metadata.get("dependency_vulnerabilities", []),
+                },
+            )
         if report.maintenance_result and report.maintenance_result.patch:
             await self.file_store.write_text(
                 report_dir / "patch.diff",
                 report.maintenance_result.patch.diff_text,
             )
-        await self.file_store.ensure_dir(report_dir / "artifacts")
         return report_dir
 
 
@@ -1513,7 +2617,8 @@ async def main_async(argv: Iterable[str] | None = None) -> int:
                 print(
                     f"{row['agent']}: active={row['active_version']} source={row['active_source']} "
                     f"candidate={row['candidate_version'] or '-'} shadow_runs={row['candidate_shadow_runs']} "
-                    f"status={row['candidate_status'] or '-'} frozen={row['frozen']}"
+                    f"status={row['candidate_status'] or '-'} cooldown_until={row['candidate_cooldown_until'] or '-'} "
+                    f"frozen={row['frozen']}"
                 )
             return 0
         if args.command == "skill-history":
@@ -1522,7 +2627,7 @@ async def main_async(argv: Iterable[str] | None = None) -> int:
                 print(
                     f"{item['created_at']} run={item['run_id']} active={item['active_version']} "
                     f"candidate={item['candidate_version'] or '-'} active_score={item['active_score']} "
-                    f"candidate_score={item['candidate_score']} promoted={item['promoted']} "
+                    f"candidate_score={item['candidate_score']} mode={item['mode']} promoted={item['promoted']} "
                     f"reasons={','.join(item['reasons']) if item['reasons'] else '-'}"
                 )
             return 0

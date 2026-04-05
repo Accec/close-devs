@@ -16,7 +16,6 @@ from core.models import (
     TaskType,
     ToolSpec,
 )
-from llm.mock import MockLLMClient
 from llm.openai_compatible import OpenAICompatibleLLMClient
 
 
@@ -43,7 +42,6 @@ async def test_openai_compatible_client_serializes_feedback_bundle_payload() -> 
     client = OpenAICompatibleLLMClient.__new__(OpenAICompatibleLLMClient)
     client.config = LLMConfig(provider="openai_compatible", model="gpt-5.4")
     client.client = StubChatClient()
-    client.fallback = MockLLMClient()
 
     snapshot = RepoSnapshot(
         repo_root="/tmp/repo",

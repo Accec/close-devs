@@ -19,6 +19,8 @@ from llm.base import BaseLLMClient
 
 
 class MockLLMClient(BaseLLMClient):
+    provider_name = "mock"
+
     async def complete_agent_step(
         self,
         *,
@@ -39,7 +41,26 @@ class MockLLMClient(BaseLLMClient):
     def _complete_static_step(self, session: AgentSession, *, skill_profile=None) -> AgentStep:
         step_index = session.step_count + 1
         tool_names = [call.tool_name for call in session.tool_calls]
-        python_targets = [target for target in session.targets if target.endswith(".py")]
+        static_context_value = session.payload.get("static_context", {})
+        if hasattr(static_context_value, "top_targets"):
+            top_targets = list(getattr(static_context_value, "top_targets", []))
+        elif isinstance(static_context_value, dict):
+            top_targets = [
+                str(item)
+                for item in static_context_value.get("top_targets", [])
+                if isinstance(item, str)
+            ]
+        else:
+            top_targets = []
+        session_targets = [
+            str(item) for item in (top_targets or session.targets) if isinstance(item, str)
+        ] or list(session.targets)
+        python_targets = [target for target in session_targets if target.endswith(".py")]
+        source_targets = [
+            target
+            for target in session_targets
+            if target.endswith((".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".java", ".kt", ".kts"))
+        ]
         preferred_tools = list(getattr(getattr(skill_profile, "policy", None), "tool_preferences", []))
 
         if "search_repo" in preferred_tools and "search_repo" not in tool_names:
@@ -48,7 +69,7 @@ class MockLLMClient(BaseLLMClient):
                 decision_summary="Start with a repository-wide search for high-signal markers before the deterministic scan.",
                 action_type=AgentActionType.TOOL_CALL,
                 tool_name="search_repo",
-                tool_input={"query": "TODO|FIXME|except:|except Exception", "paths": session.targets},
+                tool_input={"query": "TODO|FIXME|except:|except Exception", "paths": session_targets},
             )
 
         if "run_static_review" not in tool_names:
@@ -57,11 +78,11 @@ class MockLLMClient(BaseLLMClient):
                 decision_summary="Run baseline static analysis before semantic review.",
                 action_type=AgentActionType.TOOL_CALL,
                 tool_name="run_static_review",
-                tool_input={"paths": session.targets},
+                tool_input={"paths": session_targets},
             )
 
         read_paths = {call.tool_input.get("path") for call in session.tool_calls if call.tool_name == "read_file"}
-        for path in session.targets[:3]:
+        for path in session_targets[:3]:
             if path not in read_paths:
                 return AgentStep(
                     step_index=step_index,
@@ -76,7 +97,7 @@ class MockLLMClient(BaseLLMClient):
             for call in session.tool_calls
             if call.tool_name == "ast_summary"
         }
-        for path in python_targets[:2]:
+        for path in (python_targets[:2] or source_targets[:2]):
             if path not in summarized_paths:
                 return AgentStep(
                     step_index=step_index,
@@ -92,7 +113,7 @@ class MockLLMClient(BaseLLMClient):
                 decision_summary="Search for TODO/FIXME markers across current targets.",
                 action_type=AgentActionType.TOOL_CALL,
                 tool_name="search_repo",
-                tool_input={"query": "TODO|FIXME", "paths": session.targets},
+                tool_input={"query": "TODO|FIXME", "paths": session_targets},
             )
 
         deterministic_findings = self._deterministic_static_findings_from_session(session)
@@ -115,7 +136,7 @@ class MockLLMClient(BaseLLMClient):
             )
         else:
             summary = (
-                f"Autonomous static review inspected {len(session.targets)} targets and produced "
+                f"Autonomous static review inspected {len(session_targets)} targets and produced "
                 f"{len(semantic_findings)} semantic findings."
             )
         return AgentStep(
@@ -285,6 +306,9 @@ class MockLLMClient(BaseLLMClient):
                             f"{item.get('message', '')}"
                         ).strip(),
                         category="runtime",
+                        root_cause_class=self._runtime_root_cause_class(
+                            f"{item.get('exception_type', '')}: {item.get('message', '')}"
+                        ),
                         evidence={"traceback": item.get("text", "")},
                     )
                     if finding.fingerprint in seen:
@@ -386,12 +410,41 @@ class MockLLMClient(BaseLLMClient):
                     description=finding.message,
                     recommended_change=f"Update {finding.path or 'the affected area'} to resolve {finding.rule_id}.",
                     severity=finding.severity,
+                    kind=self._fix_request_kind(finding),
+                    confidence=self._fix_request_confidence(finding),
                     affected_files=[finding.path] if finding.path else [],
                     evidence=evidence,
-                    metadata={"rule_id": finding.rule_id},
+                    metadata={
+                        "rule_id": finding.rule_id,
+                        "root_cause_class": finding.root_cause_class,
+                    },
                 )
             )
         return requests
+
+    def _fix_request_kind(self, finding: Finding) -> str:
+        if finding.root_cause_class in {"dependency", "config", "runtime"}:
+            return finding.root_cause_class
+        if finding.category in {"dependency", "config"}:
+            return finding.category
+        return "code"
+
+    def _fix_request_confidence(self, finding: Finding) -> float:
+        if finding.root_cause_class == "dependency":
+            return 0.95
+        if finding.root_cause_class == "config":
+            return 0.9
+        if finding.severity in {Severity.HIGH, Severity.CRITICAL}:
+            return 0.85
+        return 0.7
+
+    def _runtime_root_cause_class(self, text: str) -> str:
+        lowered = text.lower()
+        if "no module named" in lowered or "modulenotfounderror" in lowered:
+            return "dependency"
+        if "keyerror" in lowered or "environment variable" in lowered:
+            return "config"
+        return "runtime"
 
     def _comment_findings(self, path: str, content: str) -> list[Finding]:
         findings: list[Finding] = []

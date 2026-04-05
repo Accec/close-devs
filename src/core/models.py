@@ -84,6 +84,11 @@ class SkillCandidateStatus(str, Enum):
     FROZEN = "frozen"
 
 
+class SkillEvaluationMode(str, Enum):
+    HEURISTIC = "heuristic"
+    REPLAY = "replay"
+
+
 def build_fingerprint(
     rule_id: str,
     path: str | None,
@@ -127,6 +132,7 @@ class ExecutionEnvironment:
     install_commands: list[str] = field(default_factory=list)
     install_errors: list[str] = field(default_factory=list)
     bootstrap_packages: list[str] = field(default_factory=list)
+    installer_summary: dict[str, str] = field(default_factory=dict)
     install_log_path: str | None = None
     environment_json_path: str | None = None
 
@@ -159,6 +165,210 @@ class ChangeSet:
 
 
 @dataclass(slots=True)
+class StartupConfigAnchor:
+    path: str
+    context: str
+    anchor_type: str
+    status: str
+    repair_hint: str | None = None
+
+
+@dataclass(slots=True)
+class StartupEntrypoint:
+    path: str
+    context: str
+    config_anchor_path: str | None = None
+    repair_hint: str | None = None
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class StartupTopology:
+    repo_root: str
+    src_layout: bool = False
+    entrypoints: list[StartupEntrypoint] = field(default_factory=list)
+    config_anchors: list[StartupConfigAnchor] = field(default_factory=list)
+    repair_hints: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class LanguageProfile:
+    primary_language: str = "unknown"
+    languages: list[str] = field(default_factory=list)
+    primary_ecosystem: str = "generic"
+    ecosystems: list[str] = field(default_factory=list)
+    language_file_counts: dict[str, int] = field(default_factory=dict)
+    enabled_adapters: list[str] = field(default_factory=list)
+    generic_review: bool = False
+
+
+@dataclass(slots=True)
+class ProjectEntrypoint:
+    path: str
+    context: str
+    language: str
+    ecosystem: str
+    config_anchor_path: str | None = None
+    repair_hint: str | None = None
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class ProjectConfigAnchor:
+    path: str
+    context: str
+    language: str
+    ecosystem: str
+    anchor_type: str
+    status: str
+    repair_hint: str | None = None
+
+
+@dataclass(slots=True)
+class ProjectTopology:
+    repo_root: str
+    languages: list[str] = field(default_factory=list)
+    ecosystems: list[str] = field(default_factory=list)
+    entrypoints: list[ProjectEntrypoint] = field(default_factory=list)
+    config_anchors: list[ProjectConfigAnchor] = field(default_factory=list)
+    dependency_manifests: list[str] = field(default_factory=list)
+    lockfiles: list[str] = field(default_factory=list)
+    package_roots: list[str] = field(default_factory=list)
+    test_roots: list[str] = field(default_factory=list)
+    repair_hints: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class LanguageAdapter:
+    language: str
+    ecosystems: list[str] = field(default_factory=list)
+    entrypoint_markers: list[str] = field(default_factory=list)
+    config_markers: list[str] = field(default_factory=list)
+    manifest_markers: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class StaticToolAdapter:
+    name: str
+    language: str
+    ecosystem: str
+    command: str
+    parser: str
+    pass_targets: bool = True
+
+
+@dataclass(slots=True)
+class DependencyAuditAdapter:
+    ecosystem: str
+    command: str
+    parser: str
+
+
+@dataclass(slots=True)
+class RepoMapSummary:
+    package_roots: list[str] = field(default_factory=list)
+    python_package_roots: list[str] = field(default_factory=list)
+    test_roots: list[str] = field(default_factory=list)
+    src_layout: bool = False
+    startup_contexts: list[str] = field(default_factory=list)
+    languages: list[str] = field(default_factory=list)
+    ecosystems: list[str] = field(default_factory=list)
+    config_files: list[str] = field(default_factory=list)
+    dependency_manifests: list[str] = field(default_factory=list)
+    lockfiles: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class ToolCoverageSummary:
+    enabled_tools: list[str] = field(default_factory=list)
+    unavailable_tools: list[str] = field(default_factory=list)
+    executed_tools: list[str] = field(default_factory=list)
+    tool_statuses: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class StaticTargetDigest:
+    prioritized_targets: list[str] = field(default_factory=list)
+    top_targets: list[str] = field(default_factory=list)
+    high_signal_targets: list[str] = field(default_factory=list)
+    low_signal_targets: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class ImportAdjacencyDigest:
+    related_files: list[str] = field(default_factory=list)
+    edges: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class BaselineStaticDigest:
+    total_findings: int = 0
+    severity_counts: dict[str, int] = field(default_factory=dict)
+    noisy_rule_counts: dict[str, int] = field(default_factory=dict)
+    top_findings: list[dict[str, Any]] = field(default_factory=list)
+    candidate_high_value_files: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class StaticContextBundle:
+    startup_topology: StartupTopology
+    project_topology: ProjectTopology
+    repo_map_summary: RepoMapSummary
+    language_profile: LanguageProfile = field(default_factory=LanguageProfile)
+    top_targets: list[str] = field(default_factory=list)
+    high_signal_targets: list[str] = field(default_factory=list)
+    related_files: list[str] = field(default_factory=list)
+    target_digest: StaticTargetDigest = field(default_factory=StaticTargetDigest)
+    import_adjacency_digest: ImportAdjacencyDigest = field(default_factory=ImportAdjacencyDigest)
+    config_anchor_digest: list[dict[str, Any]] = field(default_factory=list)
+    baseline_static_digest: BaselineStaticDigest = field(default_factory=BaselineStaticDigest)
+    baseline_tool_digest: BaselineStaticDigest = field(default_factory=BaselineStaticDigest)
+    tool_coverage_summary: ToolCoverageSummary = field(default_factory=ToolCoverageSummary)
+    enabled: bool = True
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "primary_language": self.language_profile.primary_language,
+            "languages": list(self.language_profile.languages),
+            "primary_ecosystem": self.language_profile.primary_ecosystem,
+            "ecosystems": list(self.language_profile.ecosystems),
+            "generic_review": self.language_profile.generic_review,
+            "startup_context_count": len(
+                {
+                    entry.context
+                    for entry in self.startup_topology.entrypoints
+                }
+                | {
+                    anchor.context
+                    for anchor in self.startup_topology.config_anchors
+                }
+            ),
+            "prioritized_target_count": len(self.target_digest.prioritized_targets),
+            "top_target_count": len(self.top_targets),
+            "high_signal_target_count": len(self.high_signal_targets),
+            "related_file_count": len(self.related_files),
+            "baseline_total_findings": self.baseline_static_digest.total_findings,
+            "baseline_severity_counts": dict(self.baseline_static_digest.severity_counts),
+            "baseline_noisy_rule_counts": dict(self.baseline_static_digest.noisy_rule_counts),
+            "tool_coverage_summary": {
+                "enabled_tools": list(self.tool_coverage_summary.enabled_tools),
+                "unavailable_tools": list(self.tool_coverage_summary.unavailable_tools),
+                "executed_tools": list(self.tool_coverage_summary.executed_tools),
+                "tool_statuses": dict(self.tool_coverage_summary.tool_statuses),
+            },
+            "project_topology_summary": {
+                "languages": list(self.project_topology.languages),
+                "ecosystems": list(self.project_topology.ecosystems),
+                "entrypoint_count": len(self.project_topology.entrypoints),
+                "config_anchor_count": len(self.project_topology.config_anchors),
+                "dependency_manifest_count": len(self.project_topology.dependency_manifests),
+                "lockfile_count": len(self.project_topology.lockfiles),
+            },
+        }
+
+
+@dataclass(slots=True)
 class Task:
     task_id: str
     run_id: str
@@ -176,6 +386,7 @@ class Finding:
     rule_id: str
     message: str
     category: str
+    root_cause_class: str | None = None
     path: str | None = None
     line: int | None = None
     symbol: str | None = None
@@ -209,6 +420,8 @@ class FixRequest:
     description: str
     recommended_change: str
     severity: Severity
+    kind: str = "code"
+    confidence: float = 0.5
     affected_files: list[str] = field(default_factory=list)
     evidence: list[EvidenceArtifact] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -271,6 +484,7 @@ class SkillCandidate:
     created_at: datetime = field(default_factory=utc_now)
     shadow_runs: int = 0
     notes: list[str] = field(default_factory=list)
+    cooldown_until: datetime | None = None
 
 
 @dataclass(slots=True)
@@ -283,6 +497,7 @@ class SkillEvaluation:
     candidate_version: str | None
     active_score: float
     candidate_score: float | None
+    mode: SkillEvaluationMode = SkillEvaluationMode.HEURISTIC
     promoted: bool = False
     reasons: list[str] = field(default_factory=list)
     created_at: datetime = field(default_factory=utc_now)
@@ -422,6 +637,7 @@ class PatchProposal:
     file_patches: list[FilePatch] = field(default_factory=list)
     validation_targets: list[str] = field(default_factory=list)
     suggestions: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
     applied: bool = False
     diff_text: str = ""
 
@@ -555,6 +771,10 @@ class WorkflowState(TypedDict, total=False):
     pr_number_override: int
     snapshot: RepoSnapshot
     change_set: ChangeSet
+    startup_topology: StartupTopology
+    project_topology: ProjectTopology
+    language_profile: LanguageProfile
+    static_context: StaticContextBundle
     static_task: Task
     dynamic_task: Task
     maintenance_task: Task
@@ -626,3 +846,7 @@ class RunContext:
     execution_environment: ExecutionEnvironment | None = None
     active_skill: SkillPack | None = None
     candidate_skill: SkillCandidate | None = None
+    startup_topology: StartupTopology | None = None
+    project_topology: ProjectTopology | None = None
+    language_profile: LanguageProfile | None = None
+    static_context: StaticContextBundle | None = None
