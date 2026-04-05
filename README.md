@@ -29,10 +29,14 @@ persisted as first-class runtime records.
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e '.[dev]'
+export OPENAI_API_KEY=your_key
 docker compose up -d postgres
 aerich upgrade
 python main.py run-once --config config/default.toml --repo .
 ```
+
+If you want a no-key smoke path, set `provider = "mock"` in
+`config/default.toml` before the first run.
 
 ## Further Reading
 
@@ -121,9 +125,21 @@ Each section controls `model`, `max_steps`, `max_tool_calls`,
 
 ## LLM Providers
 
-- `mock`: deterministic local fallback
-- `openai_compatible`: any OpenAI-compatible endpoint via `base_url`, `model`,
-  and an API key env var configured in `config/default.toml`
+- `mock`: deterministic local test path
+- `openai`: native OpenAI via `langchain_openai`
+- `openai_compatible`: OpenAI-compatible gateways via `base_url`
+- `anthropic`: native Anthropic via `langchain_anthropic`
+- `google_genai`: native Gemini via `langchain_google_genai`
+- `ollama`: local models via `langchain_ollama`
+
+Provider routing is per-agent. `[llm]` defines the global default, and
+`[agents.static]`, `[agents.dynamic]`, and `[agents.maintenance]` can override
+`provider`, `model`, `base_url`, `api_key_env`, `temperature`,
+`timeout_seconds`, and `system_prompt`.
+
+Close-Devs now uses strict failure semantics for real providers. If a required
+API key or provider dependency is missing, the run fails instead of silently
+falling back to `mock`.
 
 ## Reports
 

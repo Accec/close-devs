@@ -178,10 +178,14 @@ Use this path if you want the default production-like local setup:
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e '.[dev]'
+export OPENAI_API_KEY=your_key
 docker compose up -d postgres
 aerich upgrade
 python main.py run-once --config config/default.toml --repo .
 ```
+
+If you want to test the runtime without a real provider, temporarily set
+`[llm].provider = "mock"` or override a specific agent provider to `mock`.
 
 ### SQLite lightweight local path
 
@@ -191,6 +195,7 @@ Use this when you want fast local runs without Docker:
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e '.[dev]'
+export OPENAI_API_KEY=your_key
 export DATABASE_URL=sqlite:////tmp/close_devs_local.db
 python main.py run-once --config config/default.toml --repo .
 ```
@@ -245,16 +250,25 @@ per-agent config.
 
 Important fields:
 
-- `provider = "mock" | "openai_compatible"`
+- `provider = "mock" | "openai" | "openai_compatible" | "anthropic" | "google_genai" | "ollama"`
 - `model`
 - `base_url`
 - `api_key_env`
 - `timeout_seconds`
 - `temperature`
+- `max_retries`
 - `system_prompt`
 
-If the configured API key env var is missing, Close-Devs falls back to
-`mock` and logs a warning.
+Provider-specific defaults:
+
+- `openai` -> `OPENAI_API_KEY`
+- `openai_compatible` -> `OPENAI_API_KEY`
+- `anthropic` -> `ANTHROPIC_API_KEY`
+- `google_genai` -> `GOOGLE_API_KEY`
+- `ollama` -> default `base_url = "http://127.0.0.1:11434"` and no API key
+
+If a real provider is selected and the required credentials are missing,
+Close-Devs fails fast. It does not silently fall back to `mock`.
 
 ### `[static_review]`
 
@@ -739,12 +753,12 @@ A run likely did not fix the main issue when:
 
 Look for these signals:
 
-- startup logs do **not** say `Falling back to mock`
-- `client=OpenAICompatibleLLMClient` appears in runtime logs
+- startup logs show `provider=...` and `client=...` for each agent
+- `summary.md` or `report.json` records `actual_llm_provider` / `actual_llm_providers`
 - summaries and handoffs contain model-driven reasoning rather than only
   deterministic tool output
 
-If you see a fallback warning, the run used `mock`.
+If the run is using `mock`, runtime metadata will say so explicitly.
 
 ## 11. Logging and Agent Activity
 
@@ -858,7 +872,9 @@ aerich upgrade
 
 Symptoms:
 
-- log warning says Close-Devs fell back to `mock`
+- startup fails before the workflow begins
+- the error says a required API key env var is missing
+- `provider = "openai"` or `provider = "openai_compatible"` is configured
 
 Fix:
 
@@ -867,6 +883,11 @@ export OPENAI_API_KEY=your_key
 ```
 
 Then rerun the command.
+
+For other providers, set the matching env var:
+
+- `ANTHROPIC_API_KEY`
+- `GOOGLE_API_KEY`
 
 ### Report-local environment is degraded
 
