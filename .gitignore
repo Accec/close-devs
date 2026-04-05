@@ -3,6 +3,8 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 *.pyc
+*.egg-info/
+default.toml
 
 reports/*
 !reports/.gitkeep
