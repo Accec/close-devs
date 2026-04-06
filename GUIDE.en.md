@@ -203,6 +203,52 @@ python main.py run-once --config config/default.toml --repo .
 This works because Close-Devs reads `DATABASE_URL` first and can infer the
 backend from the DSN.
 
+### Remote repository path
+
+Close-Devs can clone a remote Git repository directly into
+`reports/<run_id>/runtime/` and run the whole workflow there:
+
+```bash
+python main.py run-once \
+  --config config/default.toml \
+  --repo https://github.com/example/project.git \
+  --repo-ref main
+```
+
+`--repo-ref` accepts a branch, tag, or commit SHA. If `--repo` points to a
+remote repository, `[environment].enabled` must remain `true`.
+
+For private repositories, the default auth paths are:
+
+- HTTPS token: `GIT_AUTH_TOKEN`
+- SSH key: `GIT_SSH_KEY_PATH`
+- optional known hosts file: `GIT_KNOWN_HOSTS_PATH`
+
+HTTPS token example:
+
+```bash
+export GIT_AUTH_TOKEN=your_token
+python main.py run-once \
+  --config config/default.toml \
+  --repo https://github.com/example/private-project.git \
+  --repo-ref main
+```
+
+SSH example:
+
+```bash
+export GIT_SSH_KEY_PATH=/abs/path/to/id_ed25519
+export GIT_KNOWN_HOSTS_PATH=/abs/path/to/known_hosts
+python main.py run-once \
+  --config config/default.toml \
+  --repo git@github.com:example/private-project.git \
+  --repo-ref main
+```
+
+The runtime injects auth through environment variables rather than placing
+secrets into the clone command string, so tokens are not written into
+`install.log` or `environment.json`.
+
 ### First-run expectations
 
 A successful first run should:
@@ -309,6 +355,15 @@ Controls report-local isolated runtime creation:
 - `install_fail_policy`
 - `python_executable`
 - `bootstrap_tools`
+- `git_auth_mode`
+- `git_https_token_env`
+- `git_https_username`
+- `git_ssh_key_path`
+- `git_ssh_key_path_env`
+- `git_known_hosts_path`
+- `git_known_hosts_path_env`
+- `git_ssh_strict_host_key_checking`
+- `git_clone_timeout_seconds`
 
 Current defaults mean:
 
@@ -316,6 +371,7 @@ Current defaults mean:
 - it applies to all analysis
 - dependency installation is auto-detected
 - failures mark the run as degraded instead of failing fast
+- remote repository clone auth defaults to auto-detection
 
 ### `[skills]`
 

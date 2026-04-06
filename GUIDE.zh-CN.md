@@ -202,6 +202,51 @@ python main.py run-once --config config/default.toml --repo .
 这是可行的，因为 Close-Devs 会优先读取 `DATABASE_URL`，并自动从 DSN 推断
 SQLite 后端。
 
+### 远程仓库路径
+
+Close-Devs 现在也可以直接把远程 Git 仓库 clone 到
+`reports/<run_id>/runtime/` 再执行完整流程：
+
+```bash
+python main.py run-once \
+  --config config/default.toml \
+  --repo https://github.com/example/project.git \
+  --repo-ref main
+```
+
+`--repo-ref` 现在接受 branch、tag 或 commit SHA。只要 `--repo` 指向远程仓库，
+就必须保持 `[environment].enabled = true`。
+
+私有仓库默认支持两条认证路径：
+
+- HTTPS token：`GIT_AUTH_TOKEN`
+- SSH key：`GIT_SSH_KEY_PATH`
+- 可选 known hosts：`GIT_KNOWN_HOSTS_PATH`
+
+HTTPS token 示例：
+
+```bash
+export GIT_AUTH_TOKEN=your_token
+python main.py run-once \
+  --config config/default.toml \
+  --repo https://github.com/example/private-project.git \
+  --repo-ref main
+```
+
+SSH 示例：
+
+```bash
+export GIT_SSH_KEY_PATH=/abs/path/to/id_ed25519
+export GIT_KNOWN_HOSTS_PATH=/abs/path/to/known_hosts
+python main.py run-once \
+  --config config/default.toml \
+  --repo git@github.com:example/private-project.git \
+  --repo-ref main
+```
+
+运行时会通过环境变量注入认证，而不是把 secret 写进 clone 命令字符串，所以
+token 不会落进 `install.log` 或 `environment.json`。
+
 ### 首次运行成功后你应该看到什么
 
 一次成功的首次运行通常会：
@@ -306,6 +351,15 @@ provider 默认约定：
 - `install_fail_policy`
 - `python_executable`
 - `bootstrap_tools`
+- `git_auth_mode`
+- `git_https_token_env`
+- `git_https_username`
+- `git_ssh_key_path`
+- `git_ssh_key_path_env`
+- `git_known_hosts_path`
+- `git_known_hosts_path_env`
+- `git_ssh_strict_host_key_checking`
+- `git_clone_timeout_seconds`
 
 当前默认含义是：
 
@@ -313,6 +367,7 @@ provider 默认约定：
 - 覆盖所有分析流程
 - 依赖安装自动探测
 - 安装失败时标记 `degraded`，而不是直接中断
+- 远程仓库 clone 认证默认走自动探测
 
 ### `[skills]`
 

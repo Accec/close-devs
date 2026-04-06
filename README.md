@@ -38,6 +38,49 @@ python main.py run-once --config config/default.toml --repo .
 If you want a no-key smoke path, set `provider = "mock"` in
 `config/default.toml` before the first run.
 
+## Remote Repositories
+
+Close-Devs can also clone a remote repository directly into the report-local
+runtime:
+
+```bash
+python main.py run-once \
+  --config config/default.toml \
+  --repo https://github.com/example/project.git \
+  --repo-ref main
+```
+
+`--repo-ref` accepts a branch, tag, or commit SHA. Remote sources require
+`[environment].enabled = true` because the runtime must materialize the
+repository before scanning.
+
+For private repositories you can use either HTTPS token auth or SSH key auth.
+
+HTTPS token auth:
+
+```bash
+export GIT_AUTH_TOKEN=your_token
+python main.py run-once \
+  --config config/default.toml \
+  --repo https://github.com/example/private-project.git \
+  --repo-ref main
+```
+
+SSH key auth:
+
+```bash
+export GIT_SSH_KEY_PATH=/abs/path/to/id_ed25519
+export GIT_KNOWN_HOSTS_PATH=/abs/path/to/known_hosts
+python main.py run-once \
+  --config config/default.toml \
+  --repo git@github.com:example/private-project.git \
+  --repo-ref main
+```
+
+The clone command is authenticated through environment variables, not by
+embedding secrets into the command line, so tokens are not written into report
+artifacts such as `install.log` or `environment.json`.
+
 ## Further Reading
 
 For day-to-day operation, configuration, report interpretation, skill
