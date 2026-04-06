@@ -1,21 +1,25 @@
 from __future__ import annotations
 
+import base64
 from dataclasses import asdict
 import logging
 import os
 from pathlib import Path
+import re
 import shutil
 import shlex
 import tomllib
 
-from core.config import AppConfig
+from core.config import AppConfig, is_remote_repo_source
 from core.models import ExecutionEnvironment
 from reports.serializer import write_json
-from tools.command_runner import CommandRunner
+from tools.command_runner import CommandResult, CommandRunner
 from tools.file_store import FileStore
 
 
 class EnvironmentManager:
+    GIT_COMMIT_REF_PATTERN = re.compile(r"^[0-9a-fA-F]{7,40}$")
+
     def __init__(
         self,
         *,
@@ -31,26 +35,48 @@ class EnvironmentManager:
         self,
         *,
         report_dir: Path,
-        source_repo_root: Path,
+        source_repo_root: Path | None,
+        source_repo: str,
+        source_ref: str | None,
         config: AppConfig,
     ) -> ExecutionEnvironment:
+        remote_source = is_remote_repo_source(source_repo)
         runtime_root = report_dir / "runtime"
         artifacts_root = report_dir / "artifacts"
-        base_workspace_root = runtime_root / "base_workspace" / source_repo_root.name
-        maintenance_workspace_root = runtime_root / "maintenance_workspace" / source_repo_root.name
-        validation_workspace_root = runtime_root / "validation_workspace" / source_repo_root.name
+        workspace_name = self._workspace_name(source_repo_root, source_repo)
+        base_workspace_root = runtime_root / "base_workspace" / workspace_name
+        maintenance_workspace_root = runtime_root / "maintenance_workspace" / workspace_name
+        validation_workspace_root = runtime_root / "validation_workspace" / workspace_name
         venv_root = runtime_root / ".venv"
         bin_dir = venv_root / ("Scripts" if os.name == "nt" else "bin")
         python_bin = bin_dir / ("python.exe" if os.name == "nt" else "python")
         install_log_path = artifacts_root / "install.log"
         environment_json_path = artifacts_root / "environment.json"
+        install_commands: list[str] = []
+        install_errors: list[str] = []
+        install_logs: list[str] = []
 
         await self.file_store.ensure_dir(runtime_root)
         await self.file_store.ensure_dir(artifacts_root)
-        await self.file_store.materialize_workspace_copy(
-            source_repo_root,
-            destination=base_workspace_root,
-        )
+        source_auth = "none"
+        if remote_source:
+            source_auth = await self._clone_remote_repository(
+                repo_source=source_repo,
+                destination=base_workspace_root,
+                cwd=runtime_root,
+                repo_ref=source_ref,
+                config=config,
+                install_commands=install_commands,
+                install_errors=install_errors,
+                install_logs=install_logs,
+            )
+        else:
+            if source_repo_root is None:
+                raise ValueError("Local repository source requires a source_repo_root path.")
+            await self.file_store.materialize_workspace_copy(
+                source_repo_root,
+                destination=base_workspace_root,
+            )
         await self.file_store.materialize_workspace_copy(
             base_workspace_root,
             destination=maintenance_workspace_root,
@@ -61,9 +87,6 @@ class EnvironmentManager:
         )
 
         detected_sources = self._detect_dependency_sources(base_workspace_root, config)
-        install_commands: list[str] = []
-        install_errors: list[str] = []
-        install_logs: list[str] = []
         bootstrap_packages = self._bootstrap_packages(config)
         installer_summary: dict[str, str] = {}
 
@@ -89,6 +112,10 @@ class EnvironmentManager:
             venv_root=str(venv_root),
             python_bin=effective_python,
             bin_dir=effective_bin_dir,
+            source_repo=source_repo,
+            source_kind="remote_git" if remote_source else "local_path",
+            source_ref=source_ref,
+            source_auth=source_auth,
             status="ready",
             detected_sources=list(detected_sources),
             install_commands=install_commands,
@@ -149,7 +176,7 @@ class EnvironmentManager:
             env.status = "degraded"
 
         await self.file_store.write_text(install_log_path, "\n\n".join(install_logs).strip() + "\n")
-        await write_json(environment_json_path, self._environment_json(env, source_repo_root))
+        await write_json(environment_json_path, self._environment_json(env))
         return env
 
     async def refresh_validation_workspace(self, environment: ExecutionEnvironment) -> Path:
@@ -394,9 +421,202 @@ class EnvironmentManager:
     def _environment_json(
         self,
         environment: ExecutionEnvironment,
-        source_repo_root: Path,
     ) -> dict[str, object]:
         data = dict(asdict(environment))
-        data["source_repo_root"] = str(source_repo_root)
         data["environment_degraded"] = environment.degraded
         return data
+
+    def _workspace_name(self, source_repo_root: Path | None, source_repo: str) -> str:
+        if source_repo_root is not None:
+            return source_repo_root.name
+        remote_tail = source_repo.rstrip("/").rsplit("/", 1)[-1]
+        remote_tail = remote_tail.rsplit(":", 1)[-1]
+        remote_tail = remote_tail.removesuffix(".git") or "remote-repo"
+        return re.sub(r"[^A-Za-z0-9_.-]+", "-", remote_tail).strip("-") or "remote-repo"
+
+    async def _clone_remote_repository(
+        self,
+        *,
+        repo_source: str,
+        destination: Path,
+        cwd: Path,
+        repo_ref: str | None,
+        config: AppConfig,
+        install_commands: list[str],
+        install_errors: list[str],
+        install_logs: list[str],
+    ) -> str:
+        clone_env, auth_mode = self._git_clone_env(repo_source, config)
+        ref_mode = "default"
+        clone_parts = ["git", "clone"]
+        if repo_ref:
+            if self._is_commit_ref(repo_ref):
+                ref_mode = "commit"
+            else:
+                ref_mode = "branch_or_tag"
+                clone_parts.extend(["--depth", "1", "--branch", repo_ref, "--single-branch"])
+        else:
+            clone_parts.extend(["--depth", "1"])
+        clone_parts.extend([repo_source, str(destination)])
+        clone_command = self._shell_join(self._git_command_parts(clone_parts, clone_env))
+        result = await self._run_git_command(
+            command=clone_command,
+            cwd=cwd,
+            timeout_seconds=config.environment.git_clone_timeout_seconds,
+            env=clone_env or None,
+            install_commands=install_commands,
+            install_errors=install_errors,
+            install_logs=install_logs,
+            auth_mode=auth_mode,
+            ref_mode=ref_mode,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Failed to clone remote repository {repo_source}: "
+                f"git clone exited with {result.returncode}"
+            )
+        if repo_ref and self._is_commit_ref(repo_ref):
+            checkout_parts = ["git", "-C", str(destination), "checkout", repo_ref]
+            checkout_command = self._shell_join(self._git_command_parts(checkout_parts, clone_env))
+            checkout_result = await self._run_git_command(
+                command=checkout_command,
+                cwd=cwd,
+                timeout_seconds=config.environment.git_clone_timeout_seconds,
+                env=clone_env or None,
+                install_commands=install_commands,
+                install_errors=install_errors,
+                install_logs=install_logs,
+                auth_mode=auth_mode,
+                ref_mode=ref_mode,
+            )
+            if checkout_result.returncode != 0:
+                raise RuntimeError(
+                    f"Failed to checkout commit {repo_ref} for remote repository {repo_source}: "
+                    f"git checkout exited with {checkout_result.returncode}"
+                )
+        return auth_mode
+
+    async def _run_git_command(
+        self,
+        *,
+        command: str,
+        cwd: Path,
+        timeout_seconds: int,
+        env: dict[str, str] | None,
+        install_commands: list[str],
+        install_errors: list[str],
+        install_logs: list[str],
+        auth_mode: str,
+        ref_mode: str,
+    ) -> CommandResult:
+        result = await self.command_runner.run(
+            command=command,
+            cwd=cwd,
+            timeout_seconds=timeout_seconds,
+            env=env,
+        )
+        install_commands.append(command)
+        install_logs.append(
+            "\n".join(
+                [
+                    f"$ {command}",
+                    f"cwd: {cwd}",
+                    f"git_auth_mode: {auth_mode}",
+                    f"git_ref_mode: {ref_mode}",
+                    f"exit_code: {result.returncode}",
+                    "--- stdout ---",
+                    result.stdout.strip(),
+                    "--- stderr ---",
+                    result.stderr.strip(),
+                ]
+            ).strip()
+        )
+        if result.returncode != 0:
+            install_errors.append(f"{command} (exit {result.returncode})")
+        return result
+
+    def _git_command_parts(
+        self,
+        parts: list[str],
+        env: dict[str, str],
+    ) -> list[str]:
+        if "CLOSE_DEVS_GIT_HTTP_EXTRA_HEADER" not in env:
+            return parts
+        return [
+            parts[0],
+            "-c",
+            'http.extraHeader="$CLOSE_DEVS_GIT_HTTP_EXTRA_HEADER"',
+            *parts[1:],
+        ]
+
+    def _shell_join(self, parts: list[str]) -> str:
+        return " ".join(
+            part if part == 'http.extraHeader="$CLOSE_DEVS_GIT_HTTP_EXTRA_HEADER"' else shlex.quote(part)
+            for part in parts
+        )
+
+    def _is_commit_ref(self, value: str) -> bool:
+        return bool(self.GIT_COMMIT_REF_PATTERN.fullmatch(value.strip()))
+
+    def _git_clone_env(
+        self,
+        repo_source: str,
+        config: AppConfig,
+    ) -> tuple[dict[str, str], str]:
+        auth_mode = config.environment.git_auth_mode.strip().lower() or "auto"
+        if auth_mode == "none":
+            return {}, "none"
+
+        if repo_source.startswith(("http://", "https://")):
+            token = os.getenv(config.environment.git_https_token_env, "").strip()
+            if token:
+                username = config.environment.git_https_username or "git"
+                header = self._basic_auth_header(username, token)
+                return {
+                    "CLOSE_DEVS_GIT_HTTP_EXTRA_HEADER": header,
+                }, "https_token"
+            if auth_mode == "https_token":
+                raise RuntimeError(
+                    "Remote Git HTTPS authentication requested but no token was found in "
+                    f"{config.environment.git_https_token_env}."
+                )
+            if auth_mode not in {"auto"}:
+                raise RuntimeError(f"git_auth_mode={auth_mode} is not compatible with HTTPS repository sources.")
+            return {}, "unauthenticated"
+
+        if repo_source.startswith(("ssh://", "git@")) or re.match(r"^[^/\s]+@[^:\s]+:.+", repo_source):
+            key_path = (
+                config.environment.git_ssh_key_path
+                or os.getenv(config.environment.git_ssh_key_path_env, "").strip()
+            )
+            known_hosts_path = (
+                config.environment.git_known_hosts_path
+                or os.getenv(config.environment.git_known_hosts_path_env, "").strip()
+            )
+            if key_path:
+                ssh_parts = [
+                    "ssh",
+                    "-i",
+                    key_path,
+                    "-o",
+                    "IdentitiesOnly=yes",
+                    "-o",
+                    f"StrictHostKeyChecking={config.environment.git_ssh_strict_host_key_checking}",
+                ]
+                if known_hosts_path:
+                    ssh_parts.extend(["-o", f"UserKnownHostsFile={known_hosts_path}"])
+                return {"GIT_SSH_COMMAND": " ".join(shlex.quote(part) for part in ssh_parts)}, "ssh_key"
+            if auth_mode == "ssh_key":
+                raise RuntimeError(
+                    "Remote Git SSH authentication requested but no key path was configured via "
+                    f"environment.git_ssh_key_path or {config.environment.git_ssh_key_path_env}."
+                )
+            if auth_mode not in {"auto"}:
+                raise RuntimeError(f"git_auth_mode={auth_mode} is not compatible with SSH repository sources.")
+            return {}, "unauthenticated"
+
+        return {}, "unauthenticated"
+
+    def _basic_auth_header(self, username: str, token: str) -> str:
+        payload = f"{username}:{token}".encode("utf-8")
+        return f"AUTHORIZATION: Basic {base64.b64encode(payload).decode('ascii')}"

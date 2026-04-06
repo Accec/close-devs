@@ -127,6 +127,10 @@ class ExecutionEnvironment:
     venv_root: str
     python_bin: str
     bin_dir: str
+    source_repo: str = ""
+    source_kind: str = "local_path"
+    source_ref: str | None = None
+    source_auth: str = "none"
     status: str = "ready"
     detected_sources: list[str] = field(default_factory=list)
     install_commands: list[str] = field(default_factory=list)
@@ -842,6 +846,7 @@ class RunContext:
     config: "AppConfig"
     state_store: "StateStore"
     logger: "logging.Logger"
+    repo_identity: str = ""
     rules: dict[str, Any] = field(default_factory=dict)
     execution_environment: ExecutionEnvironment | None = None
     active_skill: SkillPack | None = None
@@ -850,3 +855,7 @@ class RunContext:
     project_topology: ProjectTopology | None = None
     language_profile: LanguageProfile | None = None
     static_context: StaticContextBundle | None = None
+
+    def __post_init__(self) -> None:
+        if not self.repo_identity:
+            self.repo_identity = str(self.repo_root)

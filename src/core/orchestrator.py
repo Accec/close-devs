@@ -232,9 +232,12 @@ class Orchestrator:
         self,
         repo_root: Path | None = None,
         pr_context: PullRequestContext | None = None,
+        repo_identity: str | None = None,
     ) -> tuple[RepoSnapshot, ChangeSet]:
         target_root = repo_root or self.config.repo_root
+        identity = repo_identity or self._configured_repo_identity()
         snapshot = await self.scanner.scan(target_root)
+        snapshot.repo_root = identity
         if pr_context is not None and pr_context.changed_files:
             change_set = ChangeSet(
                 changed_files=sorted(set(pr_context.changed_files)),
@@ -246,7 +249,7 @@ class Orchestrator:
             )
             return snapshot, change_set
 
-        previous_snapshot = await self.state_store.get_latest_snapshot(str(target_root))
+        previous_snapshot = await self.state_store.get_latest_snapshot(identity)
         change_set = await self.change_detector.detect(target_root, snapshot, previous_snapshot)
         return snapshot, change_set
 
@@ -293,7 +296,7 @@ class Orchestrator:
                 result.summary,
             )
         reflection, candidate = await self.skill_evolution.reflect_and_seed_candidate(
-            repo_root=str(context.repo_root),
+            repo_root=context.repo_identity,
             run_id=context.run_id,
             task_id=task.task_id,
             session_id=str(result.artifacts.get("session_id", "")),
@@ -317,7 +320,7 @@ class Orchestrator:
         started_at = datetime.now(timezone.utc)
         run_id = await self.state_store.start_run(
             "maintenance_loop",
-            str(self.config.repo_root),
+            self._configured_repo_identity(),
             started_at=started_at,
         )
         try:
@@ -339,13 +342,22 @@ class Orchestrator:
         started_at = datetime.now(timezone.utc)
         run_id = await self.state_store.start_run(
             "static_review",
-            str(self.config.repo_root),
+            self._configured_repo_identity(),
             started_at=started_at,
         )
         try:
-            environment = await self._prepare_execution_environment(run_id, self.config.repo_root)
-            active_skills, candidate_skills = await self._prepare_run_skills(self.config.repo_root)
-            snapshot, change_set = await self.scan_repository()
+            environment = await self._prepare_execution_environment(
+                run_id,
+                None if self.config.repo_is_remote else self.config.repo_root,
+                repo_source=self._configured_repo_identity(),
+                repo_ref=self.config.repo_ref,
+            )
+            active_skills, candidate_skills = await self._prepare_run_skills(self._configured_repo_identity())
+            scan_root = Path(environment.base_workspace_root) if environment is not None else self.config.repo_root
+            snapshot, change_set = await self.scan_repository(
+                scan_root,
+                repo_identity=self._configured_repo_identity(),
+            )
             await self.state_store.save_snapshot(run_id, snapshot)
             review_targets = sorted(set(change_set.added_files + change_set.changed_files))
             static_context = await self._build_static_context(
@@ -362,6 +374,7 @@ class Orchestrator:
                 run_id,
                 working_repo_root=analysis_root,
                 repo_root=self.config.repo_root,
+                repo_identity=self._configured_repo_identity(),
                 execution_environment=environment,
                 active_skill=active_skills.get(AgentKind.STATIC_REVIEW.value),
                 candidate_skill=candidate_skills.get(AgentKind.STATIC_REVIEW.value),
@@ -381,13 +394,13 @@ class Orchestrator:
             result = await self.execute_task(task, context)
             candidate_skills = await self._refresh_candidate_skills(
                 {"candidate_skills": candidate_skills},
-                self.config.repo_root,
+                self._configured_repo_identity(),
             )
-            await self.issue_catalog.record_findings(str(self.config.repo_root), run_id, result.findings)
+            await self.issue_catalog.record_findings(self._configured_repo_identity(), run_id, result.findings)
             report = WorkflowReport(
                 run_id=run_id,
                 workflow_name="static_review",
-                repo_root=str(self.config.repo_root),
+                repo_root=self._configured_repo_identity(),
                 started_at=started_at,
                 finished_at=datetime.now(timezone.utc),
                 status=result.status,
@@ -412,7 +425,7 @@ class Orchestrator:
             report.metadata.update(self._static_context_metadata(static_context))
             report.metadata.update(
                 await self.skill_evolution.evaluate_report(
-                    repo_root=str(self.config.repo_root),
+                    repo_root=self._configured_repo_identity(),
                     report=report,
                     active_skills=active_skills,
                     candidate_skills=candidate_skills,
@@ -435,7 +448,7 @@ class Orchestrator:
         started_at = datetime.now(timezone.utc)
         run_id = await self.state_store.start_run(
             "incident_debug",
-            str(self.config.repo_root),
+            self._configured_repo_identity(),
             started_at=started_at,
         )
         try:
@@ -463,7 +476,7 @@ class Orchestrator:
         started_at = datetime.now(timezone.utc)
         run_id = await self.state_store.start_run(
             "pull_request_maintenance",
-            str(self.config.repo_root),
+            self._configured_repo_identity(),
             started_at=started_at,
         )
         initial_state: WorkflowState = {
@@ -602,7 +615,7 @@ class Orchestrator:
         return report
 
     async def latest_report_path(self) -> Path | None:
-        latest = await self.run_history.latest(str(self.config.repo_root))
+        latest = await self.run_history.latest(self._configured_repo_identity())
         if latest is None or not latest.get("report_dir"):
             return None
         return Path(str(latest["report_dir"]))
@@ -612,6 +625,7 @@ class Orchestrator:
         run_id: str,
         working_repo_root: Path,
         repo_root: Path | None = None,
+        repo_identity: str | None = None,
         execution_environment: ExecutionEnvironment | None = None,
         active_skill=None,
         candidate_skill=None,
@@ -623,6 +637,7 @@ class Orchestrator:
         return RunContext(
             run_id=run_id,
             repo_root=repo_root or self.config.repo_root,
+            repo_identity=repo_identity or self._configured_repo_identity(),
             working_repo_root=working_repo_root,
             config=self.config,
             state_store=self.state_store,
@@ -640,21 +655,28 @@ class Orchestrator:
     async def _prepare_execution_environment(
         self,
         run_id: str,
-        source_repo_root: Path,
+        source_repo_root: Path | None,
+        *,
+        repo_source: str,
+        repo_ref: str | None = None,
     ) -> ExecutionEnvironment | None:
         if not self.config.environment.enabled:
+            if self.config.repo_is_remote:
+                raise ValueError("Remote repository sources require environment.enabled = true.")
             return None
         report_dir = self.config.reports_dir / run_id
         await self.file_store.ensure_dir(report_dir)
         return await self.environment_manager.prepare(
             report_dir=report_dir,
             source_repo_root=source_repo_root,
+            source_repo=repo_source,
+            source_ref=repo_ref,
             config=self.config,
         )
 
     async def _prepare_run_skills(
         self,
-        repo_root: Path,
+        repo_root: Path | str,
     ) -> tuple[dict[str, object], dict[str, object]]:
         return await self.skill_manager.resolve_run_skills(
             repo_root,
@@ -669,6 +691,14 @@ class Orchestrator:
         if "pr_repo_root" in state:
             return Path(state["pr_repo_root"])
         return self.config.repo_root
+
+    def _configured_repo_identity(self) -> str:
+        return self.config.repo_source
+
+    def _repo_identity(self, state: WorkflowState) -> str:
+        if "pr_repo_root" in state:
+            return str(state["pr_repo_root"])
+        return self._configured_repo_identity()
 
     def _analysis_root(self, state: WorkflowState) -> Path:
         environment = state.get("execution_environment")
@@ -698,7 +728,7 @@ class Orchestrator:
     async def _refresh_candidate_skills(
         self,
         state: WorkflowState,
-        repo_root: Path,
+        repo_root: Path | str,
     ) -> dict[str, object]:
         refreshed = dict(state.get("candidate_skills", {}))
         for agent_kind in AgentKind:
@@ -718,6 +748,10 @@ class Orchestrator:
         return {
             "environment_status": environment.status,
             "environment_degraded": environment.degraded,
+            "repo_source": environment.source_repo,
+            "repo_source_kind": environment.source_kind,
+            "repo_ref": environment.source_ref,
+            "repo_source_auth": environment.source_auth,
             "dependency_sources": list(environment.detected_sources),
             "install_commands": list(environment.install_commands),
             "install_failures": list(environment.install_errors),
@@ -901,11 +935,11 @@ class Orchestrator:
     async def _skill_report_metadata(self, state: WorkflowState, report: WorkflowReport) -> dict[str, object]:
         candidate_skills = await self._refresh_candidate_skills(
             state,
-            self._source_repo_root(state),
+            self._repo_identity(state),
         )
         shadow_replays = await self._shadow_replay_candidates(state, report, candidate_skills)
         return await self.skill_evolution.evaluate_report(
-            repo_root=str(self._source_repo_root(state)),
+            repo_root=self._repo_identity(state),
             report=report,
             active_skills=dict(state.get("active_skills", {})),
             candidate_skills=candidate_skills,
@@ -968,6 +1002,7 @@ class Orchestrator:
             state["run_id"],
             working_root,
             repo_root=self._source_repo_root(state),
+            repo_identity=self._repo_identity(state),
             execution_environment=state.get("execution_environment"),
             active_skill=candidate_skill.skill_pack,
             candidate_skill=None,
@@ -1359,9 +1394,22 @@ class Orchestrator:
         return graph.compile()
 
     async def _node_scan_maintenance(self, state: WorkflowState) -> WorkflowState:
-        environment = await self._prepare_execution_environment(state["run_id"], self.config.repo_root)
-        active_skills, candidate_skills = await self._prepare_run_skills(self.config.repo_root)
-        snapshot, change_set = await self.scan_repository()
+        environment = await self._prepare_execution_environment(
+            state["run_id"],
+            None if self.config.repo_is_remote else self.config.repo_root,
+            repo_source=self._configured_repo_identity(),
+            repo_ref=self.config.repo_ref,
+        )
+        active_skills, candidate_skills = await self._prepare_run_skills(self._configured_repo_identity())
+        scan_root = (
+            Path(environment.base_workspace_root)
+            if environment is not None
+            else self.config.repo_root
+        )
+        snapshot, change_set = await self.scan_repository(
+            scan_root,
+            repo_identity=self._configured_repo_identity(),
+        )
         await self.state_store.save_snapshot(state["run_id"], snapshot)
         review_targets = sorted(set(change_set.changed_files + change_set.added_files))
         analysis_root = (
@@ -1396,9 +1444,22 @@ class Orchestrator:
         }
 
     async def _node_scan_incident_debug(self, state: WorkflowState) -> WorkflowState:
-        environment = await self._prepare_execution_environment(state["run_id"], self.config.repo_root)
-        active_skills, candidate_skills = await self._prepare_run_skills(self.config.repo_root)
-        snapshot, change_set = await self.scan_repository()
+        environment = await self._prepare_execution_environment(
+            state["run_id"],
+            None if self.config.repo_is_remote else self.config.repo_root,
+            repo_source=self._configured_repo_identity(),
+            repo_ref=self.config.repo_ref,
+        )
+        active_skills, candidate_skills = await self._prepare_run_skills(self._configured_repo_identity())
+        scan_root = (
+            Path(environment.base_workspace_root)
+            if environment is not None
+            else self.config.repo_root
+        )
+        snapshot, change_set = await self.scan_repository(
+            scan_root,
+            repo_identity=self._configured_repo_identity(),
+        )
         await self.state_store.save_snapshot(state["run_id"], snapshot)
         dynamic_task = Task(
             task_id=self.dispatcher._new_task_id(),
@@ -1441,9 +1502,17 @@ class Orchestrator:
 
     async def _node_scan_pr_repo(self, state: WorkflowState) -> WorkflowState:
         source_root = Path(state["pr_repo_root"])
-        environment = await self._prepare_execution_environment(state["run_id"], source_root)
+        environment = await self._prepare_execution_environment(
+            state["run_id"],
+            source_root,
+            repo_source=str(source_root),
+        )
         active_skills, candidate_skills = await self._prepare_run_skills(source_root)
-        snapshot, change_set = await self.scan_repository(source_root, state["pr_context"])
+        snapshot, change_set = await self.scan_repository(
+            source_root,
+            state["pr_context"],
+            repo_identity=str(source_root),
+        )
         await self.state_store.save_snapshot(state["run_id"], snapshot)
         review_targets = sorted(set(change_set.changed_files + change_set.added_files))
         analysis_root = (
@@ -1485,6 +1554,7 @@ class Orchestrator:
             state["run_id"],
             root,
             repo_root=self._source_repo_root(state),
+            repo_identity=self._repo_identity(state),
             execution_environment=state.get("execution_environment"),
             active_skill=active_skill,
             candidate_skill=candidate_skill,
@@ -1511,6 +1581,7 @@ class Orchestrator:
             state["run_id"],
             root,
             repo_root=self._source_repo_root(state),
+            repo_identity=self._repo_identity(state),
             execution_environment=state.get("execution_environment"),
             active_skill=active_skill,
             candidate_skill=candidate_skill,
@@ -1527,7 +1598,7 @@ class Orchestrator:
     async def _node_feedback_merge(self, state: WorkflowState) -> WorkflowState:
         initial_findings = [*state["static_result"].findings, *state["dynamic_result"].findings]
         await self.issue_catalog.record_findings(
-            str(self._source_repo_root(state)),
+            self._repo_identity(state),
             state["run_id"],
             initial_findings,
         )
@@ -1560,7 +1631,7 @@ class Orchestrator:
             "maintenance_task": maintenance_task,
             "candidate_skills": await self._refresh_candidate_skills(
                 state,
-                self._source_repo_root(state),
+                self._repo_identity(state),
             ),
             "artifacts": {"handoff_count": len(handoffs)},
         }
@@ -1572,6 +1643,7 @@ class Orchestrator:
             state["run_id"],
             maintenance_root,
             repo_root=self._source_repo_root(state),
+            repo_identity=self._repo_identity(state),
             execution_environment=state.get("execution_environment"),
             active_skill=active_skill,
             candidate_skill=candidate_skill,
@@ -1585,7 +1657,7 @@ class Orchestrator:
             "maintenance_result": result,
             "candidate_skills": await self._refresh_candidate_skills(
                 state,
-                self._source_repo_root(state),
+                self._repo_identity(state),
             ),
         }
         patch = result.patch
@@ -1600,6 +1672,7 @@ class Orchestrator:
                 validation_workspace_root = await self.file_store.materialize_workspace_copy(base_root)
                 await self.patch_service.apply(validation_workspace_root, patch)
             validation_snapshot = await self.scanner.scan(validation_workspace_root)
+            validation_snapshot.repo_root = self._repo_identity(state)
             static_task, dynamic_task = self.dispatcher.create_validation_tasks(
                 run_id=state["run_id"],
                 patch=patch,
@@ -1664,6 +1737,7 @@ class Orchestrator:
             state["run_id"],
             maintenance_root,
             repo_root=self._source_repo_root(state),
+            repo_identity=self._repo_identity(state),
             execution_environment=state.get("execution_environment"),
             active_skill=active_skill,
             candidate_skill=candidate_skill,
@@ -1698,6 +1772,7 @@ class Orchestrator:
             await self.patch_service.apply(validation_workspace_root, followup_result.patch)
         state["validation_workspace_root"] = str(validation_workspace_root)
         state["validation_snapshot"] = await self.scanner.scan(validation_workspace_root)
+        state["validation_snapshot"].repo_root = self._repo_identity(state)
         static_task, dynamic_task = self.dispatcher.create_validation_tasks(
             run_id=state["run_id"],
             patch=merged_result.patch or followup_result.patch,
@@ -2044,14 +2119,14 @@ class Orchestrator:
             dynamic_original = list(state["feedback"].dynamic_findings)
             if "comparison" not in state["validation_static_result"].artifacts:
                 state["validation_static_result"].artifacts["comparison"] = await self.issue_catalog.reconcile(
-                    str(self._source_repo_root(state)),
+                    self._repo_identity(state),
                     state["run_id"],
                     static_original,
                     state["validation_static_result"].findings,
                 )
             if "comparison" not in state["validation_dynamic_result"].artifacts:
                 state["validation_dynamic_result"].artifacts["comparison"] = await self.issue_catalog.reconcile(
-                    str(self._source_repo_root(state)),
+                    self._repo_identity(state),
                     state["run_id"],
                     dynamic_original,
                     state["validation_dynamic_result"].findings,
@@ -2104,13 +2179,13 @@ class Orchestrator:
             ]
             dynamic_original = list(state["feedback"].dynamic_findings)
             static_comparison = await self.issue_catalog.reconcile(
-                str(self._source_repo_root(state)),
+                self._repo_identity(state),
                 state["run_id"],
                 static_original,
                 state["validation_static_result"].findings,
             )
             dynamic_comparison = await self.issue_catalog.reconcile(
-                str(self._source_repo_root(state)),
+                self._repo_identity(state),
                 state["run_id"],
                 dynamic_original,
                 state["validation_dynamic_result"].findings,
@@ -2121,7 +2196,7 @@ class Orchestrator:
         report = WorkflowReport(
             run_id=state["run_id"],
             workflow_name="maintenance_loop",
-            repo_root=str(self._source_repo_root(state)),
+            repo_root=self._repo_identity(state),
             started_at=state["started_at"],
             finished_at=datetime.now(timezone.utc),
             status=self._workflow_status(
@@ -2167,14 +2242,14 @@ class Orchestrator:
 
     async def _node_persist_incident_report(self, state: WorkflowState) -> WorkflowState:
         await self.issue_catalog.record_findings(
-            str(self._source_repo_root(state)),
+            self._repo_identity(state),
             state["run_id"],
             state["dynamic_result"].findings,
         )
         report = WorkflowReport(
             run_id=state["run_id"],
             workflow_name="incident_debug",
-            repo_root=str(self._source_repo_root(state)),
+            repo_root=self._repo_identity(state),
             started_at=state["started_at"],
             finished_at=datetime.now(timezone.utc),
             status=state["dynamic_result"].status,
@@ -2216,13 +2291,13 @@ class Orchestrator:
             ]
             dynamic_original = list(state["feedback"].dynamic_findings)
             static_comparison = await self.issue_catalog.reconcile(
-                str(self._source_repo_root(state)),
+                self._repo_identity(state),
                 state["run_id"],
                 static_original,
                 state["validation_static_result"].findings,
             )
             dynamic_comparison = await self.issue_catalog.reconcile(
-                str(self._source_repo_root(state)),
+                self._repo_identity(state),
                 state["run_id"],
                 dynamic_original,
                 state["validation_dynamic_result"].findings,
@@ -2304,7 +2379,7 @@ class Orchestrator:
         return WorkflowReport(
             run_id=state["run_id"],
             workflow_name="pull_request_maintenance",
-            repo_root=str(self._source_repo_root(state)),
+            repo_root=self._repo_identity(state),
             started_at=state["started_at"],
             finished_at=datetime.now(timezone.utc),
             status=self._workflow_status(
@@ -2429,7 +2504,12 @@ def _build_parser() -> argparse.ArgumentParser:
     common_parser.add_argument(
         "--repo",
         default=None,
-        help="Target repository root. Defaults to the config value.",
+        help="Target repository root or remote Git URL. Defaults to the config value.",
+    )
+    common_parser.add_argument(
+        "--repo-ref",
+        default=None,
+        help="Optional branch, tag, or commit SHA when --repo points to a remote Git repository.",
     )
 
     subparsers.add_parser("run-once", parents=[common_parser], help="Run the maintenance loop once.")
@@ -2560,7 +2640,8 @@ async def main_async(argv: Iterable[str] | None = None) -> int:
     args = parser.parse_args(list(argv) if argv is not None else None)
     config = load_config(
         Path(args.config),
-        repo_override=Path(args.repo).resolve() if args.repo else None,
+        repo_override=args.repo,
+        repo_ref_override=args.repo_ref,
     )
     orchestrator = await Orchestrator.create(config)
     try:
@@ -2569,7 +2650,21 @@ async def main_async(argv: Iterable[str] | None = None) -> int:
             _print_report(report)
             return 0
         if args.command == "scan":
-            snapshot, change_set = await orchestrator.scan_repository()
+            if config.repo_is_remote:
+                environment = await orchestrator._prepare_execution_environment(
+                    f"scan-{uuid4().hex}",
+                    None,
+                    repo_source=config.repo_source,
+                    repo_ref=config.repo_ref,
+                )
+                snapshot, change_set = await orchestrator.scan_repository(
+                    Path(environment.base_workspace_root),
+                    repo_identity=config.repo_source,
+                )
+            else:
+                snapshot, change_set = await orchestrator.scan_repository(
+                    repo_identity=config.repo_source,
+                )
             print(f"Files tracked: {len(snapshot.files)}")
             print(f"Changed: {len(change_set.changed_files)}")
             print(f"Added: {len(change_set.added_files)}")
@@ -2610,7 +2705,7 @@ async def main_async(argv: Iterable[str] | None = None) -> int:
                     print(summary_path.read_text(encoding="utf-8"))
             return 0
         if args.command == "skill-status":
-            rows = await orchestrator.skill_manager.skill_status(config.repo_root)
+            rows = await orchestrator.skill_manager.skill_status(config.repo_source)
             if args.agent:
                 rows = [row for row in rows if row["agent"] == args.agent]
             for row in rows:
@@ -2622,7 +2717,7 @@ async def main_async(argv: Iterable[str] | None = None) -> int:
                 )
             return 0
         if args.command == "skill-history":
-            history = await orchestrator.skill_manager.history(config.repo_root, AgentKind(args.agent))
+            history = await orchestrator.skill_manager.history(config.repo_source, AgentKind(args.agent))
             for item in history:
                 print(
                     f"{item['created_at']} run={item['run_id']} active={item['active_version']} "
@@ -2633,7 +2728,7 @@ async def main_async(argv: Iterable[str] | None = None) -> int:
             return 0
         if args.command == "skill-freeze":
             await orchestrator.skill_manager.freeze(
-                config.repo_root,
+                config.repo_source,
                 AgentKind(args.agent),
                 frozen=not bool(args.unfreeze),
             )
@@ -2641,7 +2736,7 @@ async def main_async(argv: Iterable[str] | None = None) -> int:
             return 0
         if args.command == "skill-promote":
             promoted = await orchestrator.skill_manager.manual_promote(
-                config.repo_root,
+                config.repo_source,
                 AgentKind(args.agent),
             )
             print(f"{args.agent}: {'promoted' if promoted else 'no-open-candidate'}")

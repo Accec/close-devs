@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 import os
 from pathlib import Path
+import re
 from typing import Any
 import tomllib
 
 
 DEFAULT_POSTGRES_URL = "postgres://close_devs:close_devs@127.0.0.1:5432/close_devs"
 APP_ROOT = Path(__file__).resolve().parents[2]
+REMOTE_REPO_SCHEMES = ("http://", "https://", "ssh://", "git://", "file://")
+REMOTE_SCP_PATTERN = re.compile(r"^[^/\s]+@[^:\s]+:.+")
 
 
 @dataclass(slots=True)
@@ -94,6 +98,15 @@ class EnvironmentConfig:
     install_fail_policy: str = "mark_degraded"
     python_executable: str = "python3"
     bootstrap_tools: bool = True
+    git_auth_mode: str = "auto"
+    git_https_token_env: str = "GIT_AUTH_TOKEN"
+    git_https_username: str = "git"
+    git_ssh_key_path: str | None = None
+    git_ssh_key_path_env: str = "GIT_SSH_KEY_PATH"
+    git_known_hosts_path: str | None = None
+    git_known_hosts_path_env: str = "GIT_KNOWN_HOSTS_PATH"
+    git_ssh_strict_host_key_checking: str = "accept-new"
+    git_clone_timeout_seconds: int = 900
     dependency_sources_priority: list[str] = field(
         default_factory=lambda: [
             "src/requirements.txt",
@@ -192,6 +205,8 @@ class AppConfig:
     state_dir: Path
     reports_dir: Path
     rules_path: Path
+    repo_source: str = ""
+    repo_ref: str | None = None
     include: list[str] = field(default_factory=lambda: ["*", "**/*"])
     exclude: list[str] = field(
         default_factory=lambda: [
@@ -224,12 +239,26 @@ class AppConfig:
     agents: AgentsConfig = field(default_factory=AgentsConfig)
     skills: SkillsConfig = field(default_factory=SkillsConfig)
 
+    def __post_init__(self) -> None:
+        if not self.repo_source:
+            self.repo_source = str(self.repo_root)
+
+    @property
+    def repo_is_remote(self) -> bool:
+        return is_remote_repo_source(self.repo_source)
+
 
 def _resolve_path(base_dir: Path, value: str | None, fallback: str) -> Path:
     raw = Path(value or fallback)
     if raw.is_absolute():
         return raw
     return (base_dir / raw).resolve()
+
+
+def _resolve_optional_path_string(base_dir: Path, value: str | None) -> str | None:
+    if value in (None, ""):
+        return None
+    return str(_resolve_path(base_dir, value, value))
 
 
 def _resolve_support_path(base_dir: Path, value: str | None, fallback: str) -> Path:
@@ -261,6 +290,41 @@ def _optional_int(value: object) -> int | None:
     if value in (None, ""):
         return None
     return int(value)
+
+
+def is_remote_repo_source(value: str | Path) -> bool:
+    raw = str(value).strip()
+    if not raw:
+        return False
+    if raw.startswith(REMOTE_REPO_SCHEMES):
+        return True
+    return bool(REMOTE_SCP_PATTERN.match(raw))
+
+
+def _remote_placeholder_root(state_dir: Path, repo_source: str) -> Path:
+    digest = hashlib.sha1(repo_source.encode("utf-8")).hexdigest()[:12]
+    stem = repo_source.rstrip("/").rsplit("/", 1)[-1]
+    stem = stem.removesuffix(".git") or "remote-repo"
+    safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "-", stem).strip("-") or "remote-repo"
+    return (state_dir / "remote_sources" / f"{safe_stem}-{digest}").resolve()
+
+
+def _resolve_repo_source(
+    *,
+    base_dir: Path,
+    state_dir: Path,
+    configured_value: object,
+    repo_override: str | Path | None,
+) -> tuple[Path, str]:
+    raw = str(repo_override).strip() if repo_override is not None else str(configured_value or ".").strip()
+    if is_remote_repo_source(raw):
+        return _remote_placeholder_root(state_dir, raw), raw
+    raw_path = Path(raw)
+    if raw_path.is_absolute():
+        resolved = raw_path.resolve()
+    else:
+        resolved = (base_dir / raw_path).resolve()
+    return resolved, str(resolved)
 
 
 def default_api_key_env_for_provider(provider: str) -> str:
@@ -320,7 +384,11 @@ def load_rules(path: Path) -> dict[str, Any]:
         return tomllib.load(handle)
 
 
-def load_config(path: Path, repo_override: Path | None = None) -> AppConfig:
+def load_config(
+    path: Path,
+    repo_override: str | Path | None = None,
+    repo_ref_override: str | None = None,
+) -> AppConfig:
     config_path = path.resolve()
     with config_path.open("rb") as handle:
         data = tomllib.load(handle)
@@ -337,14 +405,16 @@ def load_config(path: Path, repo_override: Path | None = None) -> AppConfig:
     skills_section = data.get("skills", {})
 
     base_dir = config_path.parent.parent if config_path.parent.name == "config" else config_path.parent
-    repo_root = (
-        repo_override.resolve()
-        if repo_override is not None
-        else _resolve_path(base_dir, app_section.get("repo_root"), ".")
-    )
     state_dir = _resolve_path(base_dir, app_section.get("state_dir"), "state")
+    repo_root, repo_source = _resolve_repo_source(
+        base_dir=base_dir,
+        state_dir=state_dir,
+        configured_value=app_section.get("repo_root"),
+        repo_override=repo_override,
+    )
     reports_dir = _resolve_path(base_dir, app_section.get("reports_dir"), "reports")
     rules_path = _resolve_support_path(base_dir, app_section.get("rules_path"), "config/rules.toml")
+    repo_ref = repo_ref_override if repo_ref_override is not None else _optional_str(app_section.get("repo_ref"))
     database_backend = str(database_section.get("backend", "postgres"))
     database_url_env = str(database_section.get("url_env", "DATABASE_URL"))
     database_url = _resolve_database_url(
@@ -364,6 +434,8 @@ def load_config(path: Path, repo_override: Path | None = None) -> AppConfig:
         state_dir=state_dir,
         reports_dir=reports_dir,
         rules_path=rules_path,
+        repo_source=repo_source,
+        repo_ref=repo_ref,
         include=list(app_section.get("include", ["*", "**/*"])),
         exclude=list(
             app_section.get(
@@ -489,6 +561,33 @@ def load_config(path: Path, repo_override: Path | None = None) -> AppConfig:
                 environment_section.get("python_executable", "python3")
             ),
             bootstrap_tools=bool(environment_section.get("bootstrap_tools", True)),
+            git_auth_mode=str(environment_section.get("git_auth_mode", "auto")),
+            git_https_token_env=str(
+                environment_section.get("git_https_token_env", "GIT_AUTH_TOKEN")
+            ),
+            git_https_username=str(
+                environment_section.get("git_https_username", "git")
+            ),
+            git_ssh_key_path=_resolve_optional_path_string(
+                base_dir,
+                _optional_str(environment_section.get("git_ssh_key_path")),
+            ),
+            git_ssh_key_path_env=str(
+                environment_section.get("git_ssh_key_path_env", "GIT_SSH_KEY_PATH")
+            ),
+            git_known_hosts_path=_resolve_optional_path_string(
+                base_dir,
+                _optional_str(environment_section.get("git_known_hosts_path")),
+            ),
+            git_known_hosts_path_env=str(
+                environment_section.get("git_known_hosts_path_env", "GIT_KNOWN_HOSTS_PATH")
+            ),
+            git_ssh_strict_host_key_checking=str(
+                environment_section.get("git_ssh_strict_host_key_checking", "accept-new")
+            ),
+            git_clone_timeout_seconds=int(
+                environment_section.get("git_clone_timeout_seconds", 900)
+            ),
             dependency_sources_priority=[
                 str(item)
                 for item in environment_section.get(

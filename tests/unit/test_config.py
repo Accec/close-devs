@@ -65,6 +65,15 @@ allowed_tools = ["read_file", "run_static_review"]
     assert config.environment.scope == "all_analysis"
     assert config.environment.install_fail_policy == "mark_degraded"
     assert config.environment.bootstrap_tools is False
+    assert config.environment.git_auth_mode == "auto"
+    assert config.environment.git_https_token_env == "GIT_AUTH_TOKEN"
+    assert config.environment.git_https_username == "git"
+    assert config.environment.git_ssh_key_path is None
+    assert config.environment.git_ssh_key_path_env == "GIT_SSH_KEY_PATH"
+    assert config.environment.git_known_hosts_path is None
+    assert config.environment.git_known_hosts_path_env == "GIT_KNOWN_HOSTS_PATH"
+    assert config.environment.git_ssh_strict_host_key_checking == "accept-new"
+    assert config.environment.git_clone_timeout_seconds == 900
     assert config.environment.dependency_sources_priority[0] == "src/requirements.txt"
     assert config.log_agent_activity is False
     assert config.llm.max_retries == 2
@@ -221,3 +230,67 @@ repo_root = "config/skills"
 
     assert config.rules_path == (PROJECT_ROOT / "config" / "rules.toml").resolve()
     assert config.skills.repo_root == (PROJECT_ROOT / "config" / "skills").resolve()
+
+
+def test_load_config_supports_remote_repo_override_and_ref(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+[app]
+repo_root = "."
+state_dir = "state"
+reports_dir = "reports"
+rules_path = "rules.toml"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_config(
+        config_path,
+        repo_override="https://github.com/example/demo.git",
+        repo_ref_override="main",
+    )
+
+    assert config.repo_is_remote is True
+    assert config.repo_source == "https://github.com/example/demo.git"
+    assert config.repo_ref == "main"
+    assert "remote_sources" in str(config.repo_root)
+
+
+def test_load_config_parses_remote_git_auth_settings(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    key_path = tmp_path / "keys" / "id_ed25519"
+    known_hosts_path = tmp_path / "ssh" / "known_hosts"
+    config_path.write_text(
+        f"""
+[app]
+repo_root = "."
+state_dir = "state"
+reports_dir = "reports"
+rules_path = "rules.toml"
+
+[environment]
+git_auth_mode = "ssh_key"
+git_https_token_env = "CUSTOM_GIT_TOKEN"
+git_https_username = "oauth2"
+git_ssh_key_path = "{key_path}"
+git_ssh_key_path_env = "CUSTOM_GIT_SSH_KEY"
+git_known_hosts_path = "{known_hosts_path}"
+git_known_hosts_path_env = "CUSTOM_KNOWN_HOSTS"
+git_ssh_strict_host_key_checking = "yes"
+git_clone_timeout_seconds = 321
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.environment.git_auth_mode == "ssh_key"
+    assert config.environment.git_https_token_env == "CUSTOM_GIT_TOKEN"
+    assert config.environment.git_https_username == "oauth2"
+    assert config.environment.git_ssh_key_path == str(key_path.resolve())
+    assert config.environment.git_ssh_key_path_env == "CUSTOM_GIT_SSH_KEY"
+    assert config.environment.git_known_hosts_path == str(known_hosts_path.resolve())
+    assert config.environment.git_known_hosts_path_env == "CUSTOM_KNOWN_HOSTS"
+    assert config.environment.git_ssh_strict_host_key_checking == "yes"
+    assert config.environment.git_clone_timeout_seconds == 321

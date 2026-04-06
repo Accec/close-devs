@@ -84,7 +84,7 @@ class MaintenanceAgent(BaseAgent):
         patch = self._extract_patch(kernel_result)
         artifacts = self.base_artifacts(kernel_result, handoffs=[])
         if patch is not None:
-            if context.config.auto_apply_patch and patch.file_patches:
+            if context.config.auto_apply_patch and patch.file_patches and not context.config.repo_is_remote:
                 await self.patch_service.apply(context.repo_root, patch)
                 patch.applied = True
         latest_patch_output = self._latest_patch_output(kernel_result)

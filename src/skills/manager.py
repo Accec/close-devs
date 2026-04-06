@@ -26,7 +26,7 @@ class SkillManager:
 
     async def resolve_run_skills(
         self,
-        repo_root: Path,
+        repo_root: Path | str,
         runtime_configs: dict[AgentKind, AgentRuntimeConfig],
     ) -> tuple[dict[str, SkillPack], dict[str, SkillCandidate]]:
         active: dict[str, SkillPack] = {}
@@ -64,7 +64,7 @@ class SkillManager:
                 )
         return active, candidates
 
-    async def skill_status(self, repo_root: Path) -> list[dict[str, Any]]:
+    async def skill_status(self, repo_root: Path | str) -> list[dict[str, Any]]:
         status_rows: list[dict[str, Any]] = []
         active, candidates = await self.resolve_run_skills(
             repo_root,
@@ -93,10 +93,10 @@ class SkillManager:
             )
         return status_rows
 
-    async def freeze(self, repo_root: Path, agent_kind: AgentKind, frozen: bool) -> None:
+    async def freeze(self, repo_root: Path | str, agent_kind: AgentKind, frozen: bool) -> None:
         await self.state_store.set_skill_binding_frozen(str(repo_root), agent_kind, frozen)
 
-    async def manual_promote(self, repo_root: Path, agent_kind: AgentKind) -> bool:
+    async def manual_promote(self, repo_root: Path | str, agent_kind: AgentKind) -> bool:
         candidate = await self.state_store.get_open_skill_candidate(str(repo_root), agent_kind)
         if candidate is None:
             return False
@@ -115,7 +115,7 @@ class SkillManager:
         )
         return True
 
-    async def history(self, repo_root: Path, agent_kind: AgentKind) -> list[dict[str, Any]]:
+    async def history(self, repo_root: Path | str, agent_kind: AgentKind) -> list[dict[str, Any]]:
         evaluations = await self.state_store.recent_skill_evaluations(str(repo_root), agent_kind, limit=20)
         return [
             {

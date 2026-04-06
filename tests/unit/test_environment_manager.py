@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+import shlex
 
 import pytest
 
@@ -21,6 +22,8 @@ from tests.support import sqlite_database_config
 @dataclass(slots=True)
 class FakeRunner:
     fail_requirement_install: bool = False
+    commands: list[str] = field(default_factory=list)
+    envs: list[dict[str, str] | None] = field(default_factory=list)
 
     async def run(
         self,
@@ -29,6 +32,12 @@ class FakeRunner:
         timeout_seconds: int = 120,
         env: dict[str, str] | None = None,
     ) -> CommandResult:
+        self.commands.append(command)
+        self.envs.append(dict(env) if env is not None else None)
+        if command.startswith("git ") and " clone " in command:
+            destination = Path(shlex.split(command)[-1])
+            destination.mkdir(parents=True, exist_ok=True)
+            (destination / "README.md").write_text("# cloned\n", encoding="utf-8")
         if " -m venv " in command:
             bin_dir = cwd / ".venv" / "bin"
             bin_dir.mkdir(parents=True, exist_ok=True)
@@ -89,6 +98,8 @@ async def test_environment_manager_prefers_src_requirements_and_writes_artifacts
     environment = await manager.prepare(
         report_dir=tmp_path / "reports" / "run-1",
         source_repo_root=repo_root,
+        source_repo=str(repo_root),
+        source_ref=None,
         config=config,
     )
 
@@ -119,6 +130,8 @@ async def test_environment_manager_installs_runtime_and_test_requirement_sources
     environment = await manager.prepare(
         report_dir=tmp_path / "reports" / "run-1b",
         source_repo_root=repo_root,
+        source_repo=str(repo_root),
+        source_ref=None,
         config=config,
     )
 
@@ -142,6 +155,8 @@ async def test_environment_manager_marks_degraded_on_install_failure(tmp_path: P
     environment = await manager.prepare(
         report_dir=tmp_path / "reports" / "run-2",
         source_repo_root=repo_root,
+        source_repo=str(repo_root),
+        source_ref=None,
         config=config,
     )
 
@@ -164,6 +179,8 @@ async def test_environment_manager_bootstraps_pip_audit_when_enabled(tmp_path: P
     environment = await manager.prepare(
         report_dir=tmp_path / "reports" / "run-2b",
         source_repo_root=repo_root,
+        source_repo=str(repo_root),
+        source_ref=None,
         config=config,
     )
 
@@ -198,6 +215,8 @@ httpx = "^0.27.0"
     environment = await manager.prepare(
         report_dir=tmp_path / "reports" / "run-3",
         source_repo_root=repo_root,
+        source_repo=str(repo_root),
+        source_ref=None,
         config=config,
     )
 
@@ -240,6 +259,8 @@ httpx = "^0.27.0"
     environment = await manager.prepare(
         report_dir=tmp_path / "reports" / "run-3b",
         source_repo_root=repo_root,
+        source_repo=str(repo_root),
+        source_ref=None,
         config=config,
     )
 
@@ -279,6 +300,8 @@ test = ["pytest>=8.0.0"]
     environment = await manager.prepare(
         report_dir=tmp_path / "reports" / "run-4",
         source_repo_root=repo_root,
+        source_repo=str(repo_root),
+        source_ref=None,
         config=config,
     )
 
@@ -325,6 +348,8 @@ distribution = true
     environment = await manager.prepare(
         report_dir=tmp_path / "reports" / "run-5",
         source_repo_root=repo_root,
+        source_repo=str(repo_root),
+        source_ref=None,
         config=config,
     )
 
@@ -368,8 +393,136 @@ package = true
     environment = await manager.prepare(
         report_dir=tmp_path / "reports" / "run-6",
         source_repo_root=repo_root,
+        source_repo=str(repo_root),
+        source_ref=None,
         config=config,
     )
 
     assert environment.detected_sources == ["uv.lock"]
     assert any(command == "uv sync --frozen --all-groups --all-extras" for command in environment.install_commands)
+
+
+@pytest.mark.asyncio
+async def test_environment_manager_clones_remote_repository_into_runtime(
+    tmp_path: Path,
+) -> None:
+    config = _build_config(tmp_path)
+    runner = FakeRunner()
+    manager = EnvironmentManager(
+        file_store=FileStore(),
+        command_runner=runner,
+    )
+
+    environment = await manager.prepare(
+        report_dir=tmp_path / "reports" / "run-remote",
+        source_repo_root=None,
+        source_repo="https://github.com/example/demo.git",
+        source_ref="main",
+        config=config,
+    )
+
+    assert environment.source_kind == "remote_git"
+    assert environment.source_repo == "https://github.com/example/demo.git"
+    assert environment.source_ref == "main"
+    assert environment.source_auth == "unauthenticated"
+    assert Path(environment.base_workspace_root).exists()
+    assert (Path(environment.base_workspace_root) / "README.md").exists()
+    assert any(command.startswith("git clone --depth 1 --branch main --single-branch") for command in environment.install_commands)
+
+
+@pytest.mark.asyncio
+async def test_environment_manager_clones_remote_repository_with_https_token_auth(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _build_config(tmp_path)
+    config.environment.git_auth_mode = "https_token"
+    config.environment.git_https_token_env = "TEST_GIT_AUTH_TOKEN"
+    config.environment.git_https_username = "oauth2"
+    monkeypatch.setenv("TEST_GIT_AUTH_TOKEN", "secret-token")
+    runner = FakeRunner()
+    manager = EnvironmentManager(
+        file_store=FileStore(),
+        command_runner=runner,
+    )
+
+    environment = await manager.prepare(
+        report_dir=tmp_path / "reports" / "run-remote-https-auth",
+        source_repo_root=None,
+        source_repo="https://github.com/example/private-demo.git",
+        source_ref="main",
+        config=config,
+    )
+
+    clone_command = next(command for command in runner.commands if " clone " in command)
+    clone_env = next(env for command, env in zip(runner.commands, runner.envs, strict=False) if " clone " in command)
+
+    assert 'http.extraHeader="$CLOSE_DEVS_GIT_HTTP_EXTRA_HEADER"' in clone_command
+    assert "secret-token" not in clone_command
+    assert clone_env is not None
+    assert clone_env["CLOSE_DEVS_GIT_HTTP_EXTRA_HEADER"].startswith("AUTHORIZATION: Basic ")
+    assert environment.source_auth == "https_token"
+
+
+@pytest.mark.asyncio
+async def test_environment_manager_clones_remote_repository_with_ssh_key_auth(
+    tmp_path: Path,
+) -> None:
+    config = _build_config(tmp_path)
+    key_path = tmp_path / "id_ed25519"
+    key_path.write_text("private-key", encoding="utf-8")
+    known_hosts_path = tmp_path / "known_hosts"
+    known_hosts_path.write_text("github.com ssh-ed25519 AAAA\n", encoding="utf-8")
+    config.environment.git_auth_mode = "ssh_key"
+    config.environment.git_ssh_key_path = str(key_path)
+    config.environment.git_known_hosts_path = str(known_hosts_path)
+    runner = FakeRunner()
+    manager = EnvironmentManager(
+        file_store=FileStore(),
+        command_runner=runner,
+    )
+
+    environment = await manager.prepare(
+        report_dir=tmp_path / "reports" / "run-remote-ssh-auth",
+        source_repo_root=None,
+        source_repo="git@github.com:example/private-demo.git",
+        source_ref="main",
+        config=config,
+    )
+
+    clone_env = next(env for command, env in zip(runner.commands, runner.envs, strict=False) if " clone " in command)
+
+    assert clone_env is not None
+    assert "GIT_SSH_COMMAND" in clone_env
+    assert str(key_path) in clone_env["GIT_SSH_COMMAND"]
+    assert str(known_hosts_path) in clone_env["GIT_SSH_COMMAND"]
+    assert environment.source_auth == "ssh_key"
+
+
+@pytest.mark.asyncio
+async def test_environment_manager_checks_out_remote_commit_sha(
+    tmp_path: Path,
+) -> None:
+    config = _build_config(tmp_path)
+    runner = FakeRunner()
+    manager = EnvironmentManager(
+        file_store=FileStore(),
+        command_runner=runner,
+    )
+
+    commit_sha = "0123456789abcdef0123456789abcdef01234567"
+    environment = await manager.prepare(
+        report_dir=tmp_path / "reports" / "run-remote-commit",
+        source_repo_root=None,
+        source_repo="https://github.com/example/private-demo.git",
+        source_ref=commit_sha,
+        config=config,
+    )
+
+    clone_command = next(command for command in runner.commands if " clone " in command)
+    checkout_command = next(command for command in runner.commands if " checkout " in command)
+
+    assert "--depth 1" not in clone_command
+    assert "--branch" not in clone_command
+    assert checkout_command.endswith(commit_sha)
+    assert environment.source_ref == commit_sha

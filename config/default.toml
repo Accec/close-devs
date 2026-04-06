@@ -81,6 +81,15 @@ install_mode = "auto_detect"
 install_fail_policy = "mark_degraded"
 python_executable = "python3"
 bootstrap_tools = true
+git_auth_mode = "auto"
+git_https_token_env = "GIT_AUTH_TOKEN"
+git_https_username = "git"
+git_ssh_key_path = ""
+git_ssh_key_path_env = "GIT_SSH_KEY_PATH"
+git_known_hosts_path = ""
+git_known_hosts_path_env = "GIT_KNOWN_HOSTS_PATH"
+git_ssh_strict_host_key_checking = "accept-new"
+git_clone_timeout_seconds = 900
 dependency_sources_priority = [
   "src/requirements.txt",
   "requirements.txt",
